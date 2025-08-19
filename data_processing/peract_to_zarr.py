@@ -24,8 +24,8 @@ def parse_arguments():
     parser = argparse.ArgumentParser()
     # Tuples: (name, type, default)
     arguments = [
-        ('root', str, '/data/group_data/katefgroup/VLA/Peract_packaged/'),
-        ('tgt', str, '/data/user_data/ngkanats/zarr_datasets/Peract_dat_zarr/')
+        ('root', str, '/home/ksaha/Research/ModelBasedPlanning/PriorWork/3d_flowmatch_actor/data/Peract_packaged/'),
+        ('tgt', str, '/home/ksaha/Research/ModelBasedPlanning/PriorWork/3d_flowmatch_actor/data/zarr_data/')
     ]
     for arg in arguments:
         parser.add_argument(f'--{arg[0]}', type=arg[1], default=arg[2])
@@ -121,15 +121,16 @@ def all_tasks_main(split, tasks):
 
 
 if __name__ == "__main__":
-    tasks = [
-        "place_cups", "close_jar", "insert_onto_square_peg",
-        "light_bulb_in", "meat_off_grill", "open_drawer",
-        "place_shape_in_shape_sorter", "place_wine_at_rack_location",
-        "push_buttons", "put_groceries_in_cupboard",
-        "put_item_in_drawer", "put_money_in_safe", "reach_and_drag",
-        "slide_block_to_color_target", "stack_blocks", "stack_cups",
-        "sweep_to_dustpan_of_size", "turn_tap"
-    ]
+    # tasks = [
+    #     "place_cups", "close_jar", "insert_onto_square_peg",
+    #     "light_bulb_in", "meat_off_grill", "open_drawer",
+    #     "place_shape_in_shape_sorter", "place_wine_at_rack_location",
+    #     "push_buttons", "put_groceries_in_cupboard",
+    #     "put_item_in_drawer", "put_money_in_safe", "reach_and_drag",
+    #     "slide_block_to_color_target", "stack_blocks", "stack_cups",
+    #     "sweep_to_dustpan_of_size", "turn_tap"
+    # ]
+    tasks = ["put_groceries_in_cupboard"]
     args = parse_arguments()
     ROOT = args.root
     STORE_PATH = args.tgt
@@ -137,7 +138,7 @@ if __name__ == "__main__":
     for split in ['train', 'val']:
         all_tasks_main(split, tasks)
     # Store instructions as json (can be run independently)
-    os.makedirs('instructions/peract', exist_ok=True)
-    instr_dict = store_instructions(ROOT, tasks, ['train', 'val', 'test'])
-    with open('instructions/peract/instructions.json', 'w') as fid:
-        json.dump(instr_dict, fid)
+    # os.makedirs('instructions/peract', exist_ok=True)
+    # instr_dict = store_instructions(ROOT, tasks, ['train', 'val', 'test'])
+    # with open('instructions/peract/instructions.json', 'w') as fid:
+    #     json.dump(instr_dict, fid)

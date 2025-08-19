@@ -8,6 +8,7 @@ output*
 *.npy
 .mypy_cache
 *.sif
+*.gif
 *.pyc
 __pycache__
 .DS_Store

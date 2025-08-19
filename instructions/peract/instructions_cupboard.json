@@ -1,0 +1,58 @@
+{
+  "put_groceries_in_cupboard": {
+    "0": [
+      "put the crackers in the cupboard",
+      "pick up the crackers and place it in the cupboard",
+      "move the crackers to the bottom shelf",
+      "put away the crackers in the cupboard"
+    ],
+    "1": [
+      "put the chocolate jello in the cupboard",
+      "pick up the chocolate jello and place it in the cupboard",
+      "move the chocolate jello to the bottom shelf",
+      "put away the chocolate jello in the cupboard"
+    ],
+    "2": [
+      "put the strawberry jello in the cupboard",
+      "pick up the strawberry jello and place it in the cupboard",
+      "move the strawberry jello to the bottom shelf",
+      "put away the strawberry jello in the cupboard"
+    ],
+    "3": [
+      "put the soup in the cupboard",
+      "pick up the soup and place it in the cupboard",
+      "move the soup to the bottom shelf",
+      "put away the soup in the cupboard"
+    ],
+    "4": [
+      "put the tuna in the cupboard",
+      "pick up the tuna and place it in the cupboard",
+      "move the tuna to the bottom shelf",
+      "put away the tuna in the cupboard"
+    ],
+    "5": [
+      "put the spam in the cupboard",
+      "pick up the spam and place it in the cupboard",
+      "move the spam to the bottom shelf",
+      "put away the spam in the cupboard"
+    ],
+    "6": [
+      "put the coffee in the cupboard",
+      "pick up the coffee and place it in the cupboard",
+      "move the coffee to the bottom shelf",
+      "put away the coffee in the cupboard"
+    ],
+    "7": [
+      "put the mustard in the cupboard",
+      "pick up the mustard and place it in the cupboard",
+      "move the mustard to the bottom shelf",
+      "put away the mustard in the cupboard"
+    ],
+    "8": [
+      "put the sugar in the cupboard",
+      "pick up the sugar and place it in the cupboard",
+      "move the sugar to the bottom shelf",
+      "put away the sugar in the cupboard"
+    ]
+  }
+}

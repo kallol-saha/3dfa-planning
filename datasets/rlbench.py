@@ -13,6 +13,11 @@ PERACT_TASKS = [
     "slide_block_to_color_target", "stack_blocks", "stack_cups",
     "sweep_to_dustpan_of_size", "turn_tap"
 ]
+
+PERACT_CUPBOARD_TASKS = [
+    "put_groceries_in_cupboard",
+]       # NOTE: Task-specific training for the cupboard task
+
 PERACT2_TASKS = [
     'bimanual_push_box',
     'bimanual_lift_ball',
@@ -126,7 +131,7 @@ class HiveformerDataset(RLBenchDataset):
 
 class PeractDataset(RLBenchDataset):
     """RLBench dataset under Peract setup."""
-    tasks = PERACT_TASKS
+    tasks = PERACT_CUPBOARD_TASKS
     cameras = ("left_shoulder", "right_shoulder", "wrist", "front")
     camera_inds = None
     train_copies = 10
@@ -163,7 +168,7 @@ class PeractDataset(RLBenchDataset):
 
 class PeractTwoCamDataset(PeractDataset):
     """RLBench dataset under Peract setup."""
-    tasks = PERACT_TASKS
+    tasks = PERACT_CUPBOARD_TASKS
     cameras = ("wrist", "front")
     camera_inds = [2, 3]
     train_copies = 10

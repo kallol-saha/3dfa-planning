@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import trange, tqdm
+import wandb
 
 from modeling.encoder.text import fetch_tokenizers
 from ..common_utils import count_parameters
@@ -19,7 +20,7 @@ from ..depth2cloud import fetch_depth2cloud
 from ..data_preprocessors import fetch_data_preprocessor
 from ..ema import EMA
 from ..schedulers import fetch_scheduler
-from .utils import compute_metrics
+from .utils import compute_metrics, visualize_pred_gt
 
 
 class BaseTrainTester:
@@ -38,7 +39,8 @@ class BaseTrainTester:
             depth2cloud=fetch_depth2cloud(self.args.dataset)
         )
 
-        if dist.get_rank() == 0 and not self.args.eval_only:
+        # TODO: This has to be replaced with wandb
+        if torch.distributed.is_initialized() and dist.get_rank() == 0 and not self.args.eval_only:
             self.writer = SummaryWriter(log_dir=args.log_dir)
 
     def get_datasets(self):
@@ -73,38 +75,41 @@ class BaseTrainTester:
         # Samplers and loaders
         g = torch.Generator()
         g.manual_seed(0)
-        train_sampler = DistributedSampler(train_dataset, drop_last=True)
+        # TODO: Uncomment for distributed training
+        # train_sampler = DistributedSampler(train_dataset, drop_last=True)
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.args.batch_size // self.args.chunk_size,
-            shuffle=False,
+            shuffle=True,  # TODO: Set to False when using distributed sampler
             num_workers=self.args.num_workers,
             worker_init_fn=seed_worker,
             collate_fn=base_collate_fn,
             pin_memory=True,
-            sampler=train_sampler,
+            # sampler=train_sampler,  # TODO: Uncomment for distributed training
             drop_last=True,
             generator=g,
             prefetch_factor=4,
             persistent_workers=True
         )
         # No sampler for val!
-        if dist.get_rank() == 0:
-            val_loader = DataLoader(
-                val_dataset,
-                batch_size=self.args.batch_size_val // self.args.chunk_size,
-                shuffle=False,
-                num_workers=self.args.num_workers,
-                collate_fn=base_collate_fn,
-                pin_memory=True,
-                sampler=None,
-                drop_last=False,
-                prefetch_factor=4,
-                persistent_workers=True
-            )
-        else:
-            val_loader = None
-        return train_loader, val_loader, train_sampler
+        # TODO: Remove distributed training check when fully migrated to non-distributed
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=self.args.batch_size_val // self.args.chunk_size,
+            shuffle=False,
+            num_workers=self.args.num_workers,
+            collate_fn=base_collate_fn,
+            pin_memory=True,
+            sampler=None,
+            drop_last=False,
+            prefetch_factor=4,
+            persistent_workers=True
+        )
+        # TODO: Uncomment for distributed training
+        # else:
+        #     val_loader = None
+        # return train_loader, val_loader, train_sampler
+        return train_loader, val_loader, None  # TODO: Return train_sampler for distributed training
 
     def get_model(self):
         """Initialize the model."""
@@ -128,8 +133,9 @@ class BaseTrainTester:
         )
 
         # Print basic modules' parameters
-        if dist.get_rank() == 0:
-            count_parameters(_model)
+        # TODO: Uncomment for distributed training
+        # if dist.get_rank() == 0:
+        count_parameters(_model)
 
         # Useful for some models to ensure parameters are contiguous
         for name, param in _model.named_parameters():
@@ -232,7 +238,8 @@ class BaseTrainTester:
         if not os.path.exists(self.args.checkpoint):
             normalizer = self.get_workspace_normalizer()
             model.workspace_normalizer.copy_(normalizer)
-            dist.barrier(device_ids=[torch.cuda.current_device()])
+            # TODO: Uncomment for distributed training
+            # dist.barrier(device_ids=[torch.cuda.current_device()])
 
         # Get optimizer
         optimizer = self.get_optimizer(model)
@@ -247,10 +254,11 @@ class BaseTrainTester:
         # make sure to compile before DDP!
         if self.args.use_compile:
             model.compute_loss = torch.compile(model.compute_loss, fullgraph=True)
-        model = DistributedDataParallel(
-            model, device_ids=[self.args.local_rank],
-            broadcast_buffers=False, find_unused_parameters=True
-        )
+        # TODO: Uncomment for distributed training
+        # model = DistributedDataParallel(
+        #     model, device_ids=[self.args.local_rank],
+        #     broadcast_buffers=False, find_unused_parameters=True
+        # )
 
         # Initialize EMA copy
         ema_model = deepcopy(model)
@@ -260,19 +268,22 @@ class BaseTrainTester:
         start_iter, best_loss = 0, None
         if self.args.checkpoint:
             start_iter, best_loss = self.load_checkpoint(model, ema_model, optimizer)
-        print(model.module.workspace_normalizer)
+        # print(model.module.workspace_normalizer)  # TODO: Uncomment for distributed training
+        print(model.workspace_normalizer)
 
         # Eval only
         if self.args.eval_only:
-            if dist.get_rank() == 0:
-                print("Test evaluation.......")
-                model.eval()
-                self.evaluate_nsteps(
-                    ema_model if self.args.use_ema else model,
-                    val_loader, step_id=-1,
-                    val_iters=-1
-                )
-            dist.barrier(device_ids=[torch.cuda.current_device()])
+            # TODO: Uncomment for distributed training
+            # if dist.get_rank() == 0:
+            print("Test evaluation.......")
+            model.eval()
+            self.evaluate_nsteps(
+                ema_model if self.args.use_ema else model,
+                val_loader, step_id=-1,
+                val_iters=-1
+            )
+            # TODO: Uncomment for distributed training
+            # dist.barrier(device_ids=[torch.cuda.current_device()])
             return ema_model if self.args.use_ema else model
 
         # Step the lr scheduler to the current step
@@ -282,7 +293,8 @@ class BaseTrainTester:
         # Step the sampler to the currect "epoch"
         samples_per_epoch = len(train_loader)
         epoch = start_iter // samples_per_epoch + 1
-        train_sampler.set_epoch(epoch)  # ensures new batches are sampled
+        # TODO: Uncomment for distributed training
+        # train_sampler.set_epoch(epoch)  # ensures new batches are sampled
 
         # Training loop
         model.train()
@@ -294,35 +306,49 @@ class BaseTrainTester:
                 # when the iterator is exhausted, we need to reset it
                 # and increment the epoch
                 epoch += 1
-                train_sampler.set_epoch(epoch)
+                # TODO: Uncomment for distributed training
+                # train_sampler.set_epoch(epoch)
                 iter_loader = iter(train_loader)
                 sample = next(iter_loader)
 
             self.train_one_step(model, optimizer, scaler, lr_scheduler, sample)
             self.ema.step(model, ema_model, self.args.use_ema, step_id)
 
-            if (step_id + 1) % self.args.val_freq == 0 and dist.get_rank() == 0:
+            # TODO: Uncomment for distributed training
+            # if (step_id + 1) % self.args.val_freq == 0 and dist.get_rank() == 0:
+            if (step_id + 1) % self.args.val_freq == 0:
+
+                # !!! NOTE This is where evaluation happens
                 print("Train evaluation.......")
+
                 model.eval()
-                self.evaluate_nsteps(
+
+                metrics = self.evaluate_nsteps(
                     ema_model if self.args.use_ema else model,
                     train_loader, step_id,
                     val_iters=10,
                     split='train'
                 )
+
                 print("Test evaluation.......")
-                new_loss = self.evaluate_nsteps(
+                val_metrics = self.evaluate_nsteps(
                     ema_model if self.args.use_ema else model,
                     val_loader, step_id,
                     val_iters=1250
                 )
+                metrics.update(val_metrics)
+                new_loss = -metrics['val-losses/mean/traj_pos_acc_001']
+
+                wandb.log(metrics)
+
                 # save model
                 best_loss = self.save_checkpoint(
                     model, ema_model, optimizer, step_id,
                     new_loss, best_loss
                 )
                 model.train()
-            dist.barrier(device_ids=[torch.cuda.current_device()])
+            # TODO: Uncomment for distributed training
+            # dist.barrier(device_ids=[torch.cuda.current_device()])
 
         return ema_model if self.args.use_ema else model
 
@@ -388,6 +414,41 @@ class BaseTrainTester:
                 )
 
             losses, losses_B = compute_metrics(pred_action, gt_action)
+            # visualize_pred_gt(sample["rgb"][0], sample["pcd"][0], pred_action[0], gt_action[0])
+
+            if split == 'val' and (step_id + 1) % self.args.vis_freq == 0:
+                # Save a random visualization for validation
+                if i == 0:  # Only for first batch
+                    B = sample["rgb"].shape[0]
+                    idx = torch.randint(0, B, (1,)).item()
+                    
+                    # Create vis directory if it doesn't exist
+                    vis_dir = os.path.join(self.args.log_dir, "vis")
+                    os.makedirs(vis_dir, exist_ok=True)
+                    
+                    # Convert to numpy and detach from GPU
+                    rgb_np = sample["rgb"][idx].cpu().detach().numpy()
+                    pcd_np = sample["pcd"][idx].cpu().detach().numpy()
+                    pred_np = pred_action[idx, 0, 0].cpu().detach().numpy()
+                    gt_np = gt_action[idx, 0, 0].cpu().detach().numpy()
+                    
+                    # Save as NPZ file
+                    filename = os.path.join(vis_dir, f"step_{(step_id + 1)}.npz")
+                    np.savez_compressed(
+                        filename,
+                        rgb=rgb_np,
+                        pcd=pcd_np,
+                        pred=pred_np,
+                        gt=gt_np,
+                        step_id=(step_id + 1)
+                    )
+                    
+                    print(f"Saved visualization data to: {filename}")
+                    print(f"  RGB shape: {rgb_np.shape}")
+                    print(f"  PCD shape: {pcd_np.shape}")
+                    print(f"  Pred shape: {pred_np.shape}")
+                    print(f"  GT shape: {gt_np.shape}")
+
 
             # Gather global statistics
             for n, l in losses.items():
@@ -396,29 +457,31 @@ class BaseTrainTester:
                     values[key] = torch.Tensor([]).to(device)
                 values[key] = torch.cat([values[key], l.unsqueeze(0)])
 
-            # Gather per-task statistics
-            tasks = np.array(sample["task"])
-            for n, l in losses_B.items():
-                for task in np.unique(tasks):
-                    key = f"{split}-loss/{task}/{n}"
-                    l_task = l[tasks == task].mean()
-                    if key not in values:
-                        values[key] = torch.Tensor([]).to(device)
-                    values[key] = torch.cat([values[key], l_task.unsqueeze(0)])
+            # Gather per-task statistics  # NOTE: Removing this because we are task specific!
+            # tasks = np.array(sample["task"])
+            # for n, l in losses_B.items():
+            #     for task in np.unique(tasks):
+            #         key = f"{split}-loss/{task}/{n}"
+            #         l_task = l[tasks == task].mean()
+            #         if key not in values:
+            #             values[key] = torch.Tensor([]).to(device)
+            #         values[key] = torch.cat([values[key], l_task.unsqueeze(0)])
 
         # Log all statistics
         values = {k: v.mean().item() for k, v in values.items()}
-        if dist.get_rank() == 0:
-            if step_id > -1:
-                for key, val in values.items():
-                    self.writer.add_scalar(key, val, step_id)
+        # TODO: Uncomment for distributed training
+        # if dist.get_rank() == 0:
+        # if step_id > -1:
+        #     for key, val in values.items():
+        #         self.writer.add_scalar(key, val, step_id)
 
-            # Also log to terminal
-            print(f"Step {step_id}:")
-            for key, value in values.items():
-                print(f"{key}: {value:.03f}")
+        # Also log to terminal
+        print(f"Step {step_id}:")
+        for key, value in values.items():
+            print(f"{key}: {value:.03f}")
 
-        return -values[f'{split}-losses/mean/traj_pos_acc_001']
+        # return -values[f'{split}-losses/mean/traj_pos_acc_001']
+        return values
 
     def load_checkpoint(self, model, ema_model, optimizer):
         """Load from checkpoint."""

@@ -1,5 +1,5 @@
-DATA_PATH=peract_raw/
-ZARR_PATH=zarr_datasets/peract/
+DATA_PATH=/home/ksaha/Research/ModelBasedPlanning/PriorWork/3d_flowmatch_actor
+ZARR_PATH=/home/ksaha/Research/ModelBasedPlanning/PriorWork/3d_flowmatch_actor
 
 # Save current directory
 CURR_DIR=$(pwd)
@@ -22,7 +22,7 @@ mv ${DATA_PATH}/peract_test ${DATA_PATH}/test
 cd "$CURR_DIR"
 
 # Then we package to zarr for training
-cd current_repo
+cd ${CURR_DIR}
 python data_processing/peract_to_zarr.py \
     --root ${DATA_PATH}/Peract_packaged/ \
     --tgt ${ZARR_PATH}

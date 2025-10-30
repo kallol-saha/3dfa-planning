@@ -110,10 +110,10 @@ class Encoder(BaseEncoder):
         # Pass each view independently through backbone
         rgb3d = einops.rearrange(rgb3d, "bt ncam c h w -> (bt ncam) c h w")
         rgb3d = self.normalize(rgb3d)
-        rgb3d_feats = self.backbone(rgb3d)
+        rgb3d_feats = self.backbone(rgb3d)      # !!! NOTE: This is the frozen RGB encoder, it is a ResNet.
         # Pass visual features through feature pyramid network
         rgb3d_feats = self.feature_pyramid(rgb3d_feats)[self.output_level]
-        feat_h, feat_w = rgb3d_feats.shape[-2:]
+        feat_h, feat_w = rgb3d_feats.shape[-2:]     # This gives a (32x32) feature map (last 2 dims), that is from where the size of the pcd is derived.
         # Merge different cameras
         rgb3d_feats = einops.rearrange(
             rgb3d_feats,
@@ -128,7 +128,7 @@ class Encoder(BaseEncoder):
         pcd = F.interpolate(
             einops.rearrange(pcd, "bt ncam c h w -> (bt ncam) c h w"),
             (feat_h, feat_w),
-            mode='bilinear'
+            mode='bilinear'     # Bilinear interpolation for spatial up or down sampling.
         )
         # Merge different cameras
         pcd = einops.rearrange(
@@ -140,3 +140,30 @@ class Encoder(BaseEncoder):
         rgb2d_feats = None
 
         return rgb3d_feats, rgb2d_feats, pcd, instr_feats
+
+    def downsample_pcd(self, pcd, height = 32, width = 32):
+        """
+        Downsample the point cloud to the given height and width.
+
+        Args:
+            - pcd: (B, N, 3)
+            - height: int
+            - width: int
+
+        Returns:
+            - pcd: (B, N, 3)
+        """
+        # Point cloud
+        num_cameras = pcd.shape[1]
+        # Interpolate point cloud to get the corresponding locations
+        pcd = F.interpolate(
+            einops.rearrange(pcd, "bt ncam c h w -> (bt ncam) c h w"),
+            (height, width),
+            mode='bilinear'     # Bilinear interpolation for spatial up or down sampling.
+        )
+        # Merge different cameras
+        pcd = einops.rearrange(
+            pcd,
+            "(bt ncam) c h w -> bt (ncam h w) c", ncam=num_cameras
+        )
+        return pcd

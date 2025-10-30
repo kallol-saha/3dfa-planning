@@ -62,23 +62,26 @@ class Encoder(nn.Module):
             - fps_scene_feats: (B, n, F), n < N
             - fps_scene_pos: (B, n, 3), n < N
         """
-        vl_enc_fn = {
-            'clip': self.encode_clip,
-        }[self._backbone_name]
-        # Compute scene features/positional embeddings, language embeddings
-        rgb3d_feats, rgb2d_feats, pcd, instr_feats = vl_enc_fn(
-            rgb3d, rgb2d, pcd, instruction
-        )
-        rgb2d_pos = None
+        # vl_enc_fn = {
+        #     'clip': self.encode_clip,
+        # }[self._backbone_name]
+        # # Compute scene features/positional embeddings, language embeddings
+        # rgb3d_feats, rgb2d_feats, pcd, instr_feats = vl_enc_fn(
+        #     rgb3d, rgb2d, pcd, instruction
+        # )
+        # rgb2d_pos = None
+
+        pcd = self.downsample_pcd(pcd, height = 32, width = 32)
 
         # Use the current end-effector position as language 'position'
-        instr_pos = proprio[:, -1:, :3].repeat(1, instr_feats.size(1), 1)
+        # instr_pos = proprio[:, -1:, :3].repeat(1, instr_feats.size(1), 1)
 
         # Encode proprioception
-        proprio_feats = self.encode_proprio(proprio, rgb3d_feats, pcd)
+        # proprio_feats = self.encode_proprio(proprio, rgb3d_feats, pcd)
 
         # Point subsampling based on scene features
-        fps_scene_feats, fps_scene_pos = self.run_dps(rgb3d_feats, pcd)
+        # fps_scene_feats, fps_scene_pos = self.run_dps(rgb3d_feats, pcd)
+        # !!! NOTE: Don't have to do the feature space subsampling because we don't have any 3D features.
 
         return (
             rgb3d_feats, pcd,
@@ -109,7 +112,7 @@ class Encoder(nn.Module):
         Args:
             - rgb3d: (B, ncam3d, 3, H, W), rgb obs of 3D cameras
             - rgb2d: (B, ncam2d, 3, H, W), rgb obs of 2D cameras
-            - pcd: (B, ncam3d, 3, H, W) or None
+            - pcd: (B, ncam3d, 3, H, W) or NoneW
             - text: [str] of len=B, text instruction
 
         Returns:
@@ -124,6 +127,18 @@ class Encoder(nn.Module):
         # features (B, Np, F)
         # context_pos (B, Np, 3)
         # outputs of analogous shape, with smaller Np
+
+        # The point of this: selecting a smaller set of scene points by looking at their embeddings (feature vectors), 
+        # not just their 3D positions.
+        # Concretely here, for features shaped [B, N, C], the sampler:
+        # Computes pairwise L2 distances in feature space (how different points are semantically).
+        # For each point, finds the average distance to its k nearest neighbors in feature space; 
+        # this estimates how “isolated” or “informative” it is.
+        # Keeps the top M points with the largest average neighbor distance (i.e., lowest local density), 
+        # which tend to be more diverse/salient.
+        # The effect: you downsample to a set that better covers distinct semantic/appearance/geometry cues encoded in the 
+        # features, rather than just uniform or spatially uniform sampling.
+        
         if self.subsampling_factor == 1:
             return features, pos
 

@@ -5,7 +5,7 @@ import einops
 
 from ..noise_scheduler import fetch_schedulers
 from ..utils.layers import AttentionModule
-from ..utils.position_encodings import SinusoidalPosEmb
+from ..utils.position_encodings import SinusoidalPosEmb, RotaryPositionEncoding3D
 from ..utils.utils import (
     compute_rotation_matrix_from_ortho6d,
     get_ortho6d_from_rotation_matrix,
@@ -82,23 +82,49 @@ class DenoiseActor(nn.Module):
         query_trajectory = proprio[:, -1:]
         return (query_trajectory,) + fixed_inputs
 
-    def policy_forward_pass(self, trajectory, timestep, fixed_inputs):
+    def downsample_pcd(self, pcd, height = 32, width = 32):
+        """
+        Downsample the point cloud to the given height and width.
+
+        Args:
+            - pcd: (B, N, 3)
+            - height: int
+            - width: int
+        """
+        # Point cloud
+        num_cameras = pcd.shape[1]
+        # Interpolate point cloud to get the corresponding locations
+        pcd = F.interpolate(
+            einops.rearrange(pcd, "bt ncam c h w -> (bt ncam) c h w"),
+            (height, width),
+            mode='bilinear'     # Bilinear interpolation for spatial up or down sampling.
+        )
+
+        # Merge different cameras
+        pcd = einops.rearrange(
+            pcd,
+            "(bt ncam) c h w -> bt (ncam h w) c", ncam=num_cameras
+        )
+        return pcd
+
+    def policy_forward_pass(self, trajectory, timestep, pcd):
         # Parse inputs
-        (
-            query_trajectory,
-            rgb3d_feats, pcd,
-            rgb2d_feats, rgb2d_pos,
-            instr_feats, instr_pos,
-            proprio_feats,
-            fps_scene_feats, fps_scene_pos
-        ) = fixed_inputs
+        # (
+        #     query_trajectory,
+        #     rgb3d_feats, pcd,
+        #     rgb2d_feats, rgb2d_pos,
+        #     instr_feats, instr_pos,
+        #     proprio_feats,
+        #     fps_scene_feats, fps_scene_pos
+        # ) = fixed_inputs
 
         # Get features from normalized (relative) trajectory
         trajectory_feats = self.traj_encoder(trajectory)
 
         # But use positions from unnormalized absolute trajectory
         traj_xyz = self.unnormalize_pos(trajectory)[..., :3]
-        if self._relative:  # relative to absolute
+        query_trajectory = None
+        if self._relative:  # relative to absolute  # This is False, ignore for now.
             traj_xyz = (
                 query_trajectory[..., :3]
                 + torch.cumsum(traj_xyz, dim=1)
@@ -108,18 +134,10 @@ class DenoiseActor(nn.Module):
             trajectory_feats,
             traj_xyz,
             timestep,
-            rgb3d_feats=rgb3d_feats,
-            rgb3d_pos=pcd,
-            rgb2d_feats=rgb2d_feats,
-            rgb2d_pos=rgb2d_pos,
-            instr_feats=instr_feats,
-            instr_pos=instr_pos,
-            proprio_feats=proprio_feats,
-            fps_scene_feats=fps_scene_feats,
-            fps_scene_pos=fps_scene_pos
+            rgb3d_pos=pcd
         )
 
-    def conditional_sample(self, trajectory, device, fixed_inputs):
+    def conditional_sample(self, trajectory, device, pcd):
         # Set schedulers
         self.position_scheduler.set_timesteps(self.n_steps, device=device)
         self.rotation_scheduler.set_timesteps(self.n_steps, device=device)
@@ -130,7 +148,7 @@ class DenoiseActor(nn.Module):
             out = self.policy_forward_pass(
                 trajectory,
                 t * torch.ones(len(trajectory)).to(device).long(),
-                fixed_inputs
+                pcd
             )
             out = out[-1]  # keep only last layer's output
             pos = self.position_scheduler.step(
@@ -147,10 +165,8 @@ class DenoiseActor(nn.Module):
 
     def compute_trajectory(self, trajectory_mask,
                            rgb3d, rgb2d, pcd, instruction, proprio):
-        # Encode observations, states, instructions
-        fixed_inputs = self.encode_inputs(
-            rgb3d, rgb2d, pcd, instruction, proprio
-        )
+        # Prepare point cloud positions only
+        pcd = self.downsample_pcd(pcd, height = 32, width = 32)
 
         # Sample from learned model starting from noise
         out_dim = 6 if self._rotation_format == 'euler' else 9
@@ -161,7 +177,7 @@ class DenoiseActor(nn.Module):
         trajectory = self.conditional_sample(
             trajectory,
             device=trajectory_mask.device,
-            fixed_inputs=fixed_inputs
+            pcd=pcd
         )
 
         # Back to quaternion
@@ -179,9 +195,14 @@ class DenoiseActor(nn.Module):
     def compute_loss(self, gt_trajectory,
                      rgb3d, rgb2d, pcd, instruction, proprio):
         # Encode observations, states, instructions
-        fixed_inputs = self.encode_inputs(
-            rgb3d, rgb2d, pcd, instruction, proprio
-        )
+
+        # !!! NOTE: Based on my changes, the only thing this is doing is bilinear downsampling the point cloud to 32x32,
+        # so, replacing with just a downsample_pcd function call.
+        # fixed_inputs = self.encode_inputs(
+        #     rgb3d, rgb2d, pcd, instruction, proprio
+        # )
+
+        pcd = self.downsample_pcd(pcd, height = 32, width = 32)
 
         # Process gt_trajectory
         gt_openess = gt_trajectory[..., -1:]
@@ -221,7 +242,7 @@ class DenoiseActor(nn.Module):
             # Predict the noise residual
             pred = self.policy_forward_pass(
                 noisy_trajectory,
-                timesteps, fixed_inputs
+                timesteps, pcd
             )
 
             # Compute loss
@@ -384,6 +405,15 @@ class TransformerHead(nn.Module):
         self.traj_time_emb = SinusoidalPosEmb(embedding_dim)
         self.hand_embed = nn.Embedding(2, embedding_dim)
 
+        # Scene token features from 3D positions only
+        self.scene_pos_to_feat = nn.Sequential(
+            nn.Linear(3, embedding_dim),
+            nn.ReLU(),
+            nn.Linear(embedding_dim, embedding_dim)
+        )
+        # 3D rotary positional encoding
+        self.relative_pe_layer = RotaryPositionEncoding3D(embedding_dim)
+
         # Attention from trajectory queries to language
         self.traj_lang_attention = AttentionModule(
             num_layers=1,
@@ -469,24 +499,25 @@ class TransformerHead(nn.Module):
             nn.Linear(embedding_dim, 1)
         )
 
-    def forward(self, traj_feats, trajectory, timesteps,
-                rgb3d_feats, rgb3d_pos, rgb2d_feats, rgb2d_pos,
-                instr_feats, instr_pos, proprio_feats,
-                fps_scene_feats, fps_scene_pos):
+    # def forward(self, traj_feats, trajectory, timesteps,
+    #             rgb3d_feats, rgb3d_pos, rgb2d_feats, rgb2d_pos,
+    #             instr_feats, instr_pos, proprio_feats,
+    #             fps_scene_feats, fps_scene_pos):
+    def forward(self, traj_feats, trajectory, timesteps, rgb3d_pos):
         """
         Arguments:
             traj_feats: (B, trajectory_length, nhand, F)
             trajectory: (B, trajectory_length, nhand, 3+6+X)
             timesteps: (B, 1)
-            rgb3d_feats: (B, N, F)
+            # rgb3d_feats: (B, N, F)
             rgb3d_pos: (B, N, 3)
-            rgb2d_feats: (B, N2d, F)
-            rgb2d_pos: (B, N2d, 3)
-            instr_feats: (B, L, F)
-            instr_pos: (B, L, 3)
-            proprio_feats: (B, nhist*nhand, F)
-            fps_scene_feats: (B, M, F), M < N
-            fps_scene_pos: (B, M, 3)
+            # rgb2d_feats: (B, N2d, F)
+            # rgb2d_pos: (B, N2d, 3)
+            # instr_feats: (B, L, F)
+            # instr_pos: (B, L, 3)
+            # proprio_feats: (B, nhist*nhand, F)
+            # fps_scene_feats: (B, M, F), M < N
+            # fps_scene_pos: (B, M, 3)
 
         Returns:
             list of (B, trajectory_length, nhand, 3+6+X)
@@ -506,28 +537,28 @@ class TransformerHead(nn.Module):
         traj_time_pos = self.traj_time_emb(
             torch.arange(0, traj_len, device=traj_feats.device)
         )[None, None].repeat(len(traj_feats), 1, nhand, 1)
+
         traj_time_pos = einops.rearrange(traj_time_pos, 'b l h c -> b (l h) c')
-        traj_feats = self.traj_lang_attention(
-            seq1=traj_feats,
-            seq2=instr_feats,
-            seq1_sem_pos=traj_time_pos, seq2_sem_pos=None
-        )[-1]
+
+        # traj_feats = self.traj_lang_attention(
+        #     seq1=traj_feats,
+        #     seq2=instr_feats,
+        #     seq1_sem_pos=traj_time_pos, seq2_sem_pos=None
+        # )[-1]
+        
         traj_feats = traj_feats + traj_time_pos
         traj_xyz = trajectory[..., :3]
 
-        # Denoising timesteps' embeddings
-        time_embs = self.encode_denoising_timestep(
-            timesteps, proprio_feats
+        # Denoising timestep embeddings (no proprioception dependency)
+        time_embs = self.encode_denoising_timestep(timesteps)
+
+        # Positional embeddings (3D rotary PE from positions)
+        rel_traj_pos, rel_scene_pos, rel_pos = self.get_positional_embeddings(
+            traj_xyz, rgb3d_pos
         )
 
-        # Positional embeddings
-        rel_traj_pos, rel_scene_pos, rel_pos = self.get_positional_embeddings(
-            traj_xyz, traj_feats,
-            rgb3d_pos, rgb3d_feats, rgb2d_feats, rgb2d_pos,
-            timesteps, proprio_feats,
-            fps_scene_feats, fps_scene_pos,
-            instr_feats, instr_pos
-        )
+        # Build scene features from positions
+        rgb3d_feats = self.scene_pos_to_feat(rgb3d_pos)
 
         # Cross attention from gripper to full context
         traj_feats = self.cross_attn(
@@ -540,8 +571,7 @@ class TransformerHead(nn.Module):
 
         # Self attention among gripper and sampled context
         features = self.get_sa_feature_sequence(
-            traj_feats, fps_scene_feats,
-            rgb3d_feats, rgb2d_feats, instr_feats
+            traj_feats, rgb3d_feats
         )
         features = self.self_attn(
             seq1=features,
@@ -569,37 +599,38 @@ class TransformerHead(nn.Module):
                  .unflatten(1, (traj_len, nhand))
         ]
 
-    def encode_denoising_timestep(self, timestep, proprio_feats):
+    def encode_denoising_timestep(self, timestep):
         """
         Compute denoising timestep features and positional embeddings.
 
         Args:
-            - timestep: (B,)
+            - timestep: (B,) or (B, 1)
 
         Returns:
             - time_feats: (B, F)
         """
+        if timestep.dim() > 1:
+            timestep = timestep.squeeze(-1)
         time_feats = self.time_emb(timestep)
-        proprio_feats = proprio_feats.flatten(1)
-        curr_gripper_feats = self.curr_gripper_emb(proprio_feats)
-        return time_feats + curr_gripper_feats
+        return time_feats
 
     def get_positional_embeddings(
         self,
-        traj_xyz, traj_feats,
-        rgb3d_pos, rgb3d_feats, rgb2d_feats, rgb2d_pos,
-        timesteps, proprio_feats,
-        fps_scene_feats, fps_scene_pos,
-        instr_feats, instr_pos
+        traj_xyz,
+        rgb3d_pos
     ):
-        return None, None, None
+        # Rotary PE for trajectories and scene positions
+        rel_traj_pos = self.relative_pe_layer(traj_xyz)
+        rel_scene_pos = self.relative_pe_layer(rgb3d_pos)
+        rel_pos = torch.cat([rel_traj_pos, rel_scene_pos], dim=1)
+        return rel_traj_pos, rel_scene_pos, rel_pos
 
     def get_sa_feature_sequence(
         self,
-        traj_feats, fps_scene_feats,
-        rgb3d_feats, rgb2d_feats, instr_feats
+        traj_feats,
+        rgb3d_feats
     ):
-        return torch.cat([traj_feats, fps_scene_feats], 1)
+        return torch.cat([traj_feats, rgb3d_feats], 1)
 
     def predict_pos(self, features, pos, time_embs, traj_len):
         position_features = self.position_self_attn(

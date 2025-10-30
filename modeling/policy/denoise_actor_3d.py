@@ -83,24 +83,24 @@ class TransformerHead(BaseTransformerHead):
         # Relative positional embeddings
         self.relative_pe_layer = RotaryPositionEncoding3D(embedding_dim)
 
-    def get_positional_embeddings(
-        self,
-        traj_xyz, traj_feats,
-        rgb3d_pos, rgb3d_feats, rgb2d_feats, rgb2d_pos,
-        timesteps, proprio_feats,
-        fps_scene_feats, fps_scene_pos,
-        instr_feats, instr_pos
-    ):
-        rel_traj_pos = self.relative_pe_layer(traj_xyz)
-        rel_scene_pos = self.relative_pe_layer(rgb3d_pos)
-        rel_fps_pos = self.relative_pe_layer(fps_scene_pos)
-        rel_pos = torch.cat([rel_traj_pos, rel_fps_pos], 1)
-        return rel_traj_pos, rel_scene_pos, rel_pos
+    # def get_positional_embeddings(
+    #     self,
+    #     traj_xyz, traj_feats,
+    #     rgb3d_pos, rgb3d_feats, rgb2d_feats, rgb2d_pos,
+    #     timesteps, proprio_feats,
+    #     fps_scene_feats, fps_scene_pos,
+    #     instr_feats, instr_pos
+    # ):
+    #     rel_traj_pos = self.relative_pe_layer(traj_xyz)
+    #     rel_scene_pos = self.relative_pe_layer(rgb3d_pos)
+    #     rel_fps_pos = self.relative_pe_layer(fps_scene_pos)
+    #     rel_pos = torch.cat([rel_traj_pos, rel_fps_pos], 1)
+    #     return rel_traj_pos, rel_scene_pos, rel_pos
 
-    def get_sa_feature_sequence(
-        self,
-        traj_feats, fps_scene_feats,
-        rgb3d_feats, rgb2d_feats, instr_feats
-    ):
-        features = torch.cat([traj_feats, fps_scene_feats], 1)
-        return features
+    # def get_sa_feature_sequence(
+    #     self,
+    #     traj_feats, fps_scene_feats,
+    #     rgb3d_feats, rgb2d_feats, instr_feats
+    # ):
+    #     features = torch.cat([traj_feats, fps_scene_feats], 1)
+    #     return features

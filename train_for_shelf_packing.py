@@ -68,7 +68,7 @@ def parse_arguments():
         ('use_ema', str2bool, False),
         ('lv2_batch_size', int, 1),
         # Model arguments: general policy type
-        ('model_type', str, 'denoise3d'),
+        ('model_type', str, 'denoise3d'),       # !!! TODO: Change here for using different models
         ('bimanual', str2bool, False),
         ('keypose_only', str2bool, True),
         ('pre_tokenize', str2bool, True),

@@ -496,6 +496,9 @@ class TransformerHead(nn.Module):
         # Trajectory features
         if nhand > 1:
             traj_feats = traj_feats + self.hand_embed.weight[None, None]
+
+        # Concatenating the second hand features along the trajectory length dimension, 
+        # this is okay because we have position embeddings to recognize that it is the second hand's trajectory.
         traj_feats = einops.rearrange(traj_feats, 'b l h c -> b (l h) c')
         trajectory = einops.rearrange(trajectory, 'b l h c -> b (l h) c')
 

@@ -57,7 +57,7 @@ def parse_arguments():
         ('memory_limit', float, 8),  # cache limit in GB
         # Logging arguments
         # ('base_log_dir', Path, Path(__file__).parent / "train_logs"),
-        ('base_log_dir', Path, "/home/ksaha/Research/ModelBasedPlanning/visplanWM/models/3dfa/train_logs"),
+        ('base_log_dir', Path, "/home/ksaha/Research/ModelBasedPlanning/visplanWM/models/flowmatch_actor/train_logs"),
         # Training and testing arguments
         ('checkpoint', str_none, 'checkpoints'),  # TODO: Change to checkpoint file if it is there
         ('val_freq', int, 100),

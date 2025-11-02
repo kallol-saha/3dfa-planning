@@ -21,8 +21,6 @@ class DenoiseActor(nn.Module):
                  # Encoder and decoder arguments
                  embedding_dim=60,
                  num_attn_heads=8,
-                 nhist=3,
-                 nhand=1,
                  # Decoder arguments
                  num_shared_attn_layers=4,
                  relative=False,
@@ -38,17 +36,21 @@ class DenoiseActor(nn.Module):
         self._relative = relative
         self._lv2_batch_size = lv2_batch_size
 
-        # Vision-language encoder, runs only once
-        self.encoder = None  # Implement this!
-
         # Action decoder, runs at every denoising timestep
         self.traj_encoder = nn.Linear(
             6 if rotation_format == 'euler' else 9,  # XYZ + Euler or 6D
             embedding_dim
         )
+
+        # Action decoder, runs at every denoising timestep
         self.prediction_head = TransformerHead(
             embedding_dim=embedding_dim,
-            nhist=nhist * nhand,
+            num_attn_heads=num_attn_heads,
+            num_shared_attn_layers=num_shared_attn_layers
+        )
+        
+        self.prediction_head = TransformerHead(
+            embedding_dim=embedding_dim,
             num_attn_heads=num_attn_heads,
             num_shared_attn_layers=num_shared_attn_layers,
             rot_dim=3 if rotation_format == 'euler' else 6
@@ -163,28 +165,26 @@ class DenoiseActor(nn.Module):
 
         return torch.cat((trajectory, out[..., -1:]), -1)
 
-    def compute_trajectory(self, trajectory_mask,
-                           rgb3d, rgb2d, pcd, instruction, proprio):
+    def compute_trajectory(self, pcd):
         # Prepare point cloud positions only
-        pcd = self.downsample_pcd(pcd, height = 32, width = 32)
+        # pcd = self.downsample_pcd(pcd, height = 32, width = 32)
 
         # Sample from learned model starting from noise
         out_dim = 6 if self._rotation_format == 'euler' else 9
         trajectory = torch.randn(
-            size=tuple(trajectory_mask.shape) + (out_dim,),
-            device=trajectory_mask.device
+            size=(pcd.shape[0], 2, out_dim),        # TODO: trajectory length is hardcoded to 2 for now.
+            device=pcd.device
         )
         trajectory = self.conditional_sample(
             trajectory,
-            device=trajectory_mask.device,
+            device=pcd.device,
             pcd=pcd
         )
 
         # Back to quaternion
-        _, traj_len, nhand, _ = trajectory.shape
         trajectory = self.unconvert_rot(
-            trajectory.flatten(1, 2)
-        ).unflatten(1, (traj_len, nhand))
+            trajectory
+        )
         # unnormalize position
         trajectory = self.unnormalize_pos(trajectory)
         # Convert gripper status to probaility
@@ -193,15 +193,13 @@ class DenoiseActor(nn.Module):
         return trajectory
 
     def compute_loss(self, gt_trajectory, pcd):
+        """
+        gt_trajectory: (B, trajectory_length, 3+4+1)        NOTE: Quaternion (wxyz) will be converted to 6D internally in the function.
+        pcd: (B, 4096, 3) in world coordinates
+        """
         # Encode observations, states, instructions
 
-        # !!! NOTE: Based on my changes, the only thing this is doing is bilinear downsampling the point cloud to 32x32,
-        # so, replacing with just a downsample_pcd function call.
-        # fixed_inputs = self.encode_inputs(
-        #     rgb3d, rgb2d, pcd, instruction, proprio
-        # )
-
-        pcd = self.downsample_pcd(pcd, height = 32, width = 32)
+        # pcd = self.downsample_pcd(pcd, height = 32, width = 32)
 
         # Process gt_trajectory
         gt_openess = gt_trajectory[..., -1:]
@@ -209,10 +207,7 @@ class DenoiseActor(nn.Module):
         # Normalize all pos
         gt_trajectory = self.normalize_pos(gt_trajectory)
         # Convert rotation parametrization
-        _, traj_len, nhand, _ = gt_trajectory.shape
-        gt_trajectory = self.convert_rot(
-            gt_trajectory.flatten(1, 2)
-        ).unflatten(1, (traj_len, nhand))
+        gt_trajectory = self.convert_rot(gt_trajectory)
 
         # Loop lv2_batch_size times and sample different noises with same input
         # Trick to effectively increase the batch size without re-encoding
@@ -337,17 +332,12 @@ class DenoiseActor(nn.Module):
     def forward(
         self,
         gt_trajectory,
-        trajectory_mask,
-        rgb3d,
-        rgb2d,
         pcd,
-        instruction,
-        proprio,
         run_inference=False
     ):
         """
         Arguments:
-            gt_trajectory: (B, trajectory_length, nhand, 3+4+X)
+            gt_trajectory: (B, trajectory_length, 3+4+X)
             pcd: (B, num_3d_cameras, 3, H, W) in world coordinates
 
         Note:
@@ -357,13 +347,12 @@ class DenoiseActor(nn.Module):
 
         Returns:
             - loss: scalar, if run_inference is False
-            - trajectory: (B, trajectory_length, nhand, 3+rot+1), at inference
+            - trajectory: (B, trajectory_length, 3+rot+1), at inference
         """
         # Inference, don't use gt_trajectory
         if run_inference:
             return self.compute_trajectory(
-                trajectory_mask,
-                pcd
+                pcd     # TODO: trajectory_mask is not used here, change the function.
             )
 
         # Training, use gt_trajectory to compute loss
@@ -379,7 +368,6 @@ class TransformerHead(nn.Module):
                  embedding_dim=60,
                  num_attn_heads=8,
                  num_shared_attn_layers=4,
-                 nhist=3,
                  rotary_pe=True,
                  rot_dim=6):
         super().__init__()
@@ -392,12 +380,11 @@ class TransformerHead(nn.Module):
             nn.Linear(embedding_dim, embedding_dim)
         )
         self.curr_gripper_emb = nn.Sequential(
-            nn.Linear(embedding_dim * nhist, embedding_dim),
+            nn.Linear(embedding_dim, embedding_dim),
             nn.ReLU(),
             nn.Linear(embedding_dim, embedding_dim)
         )
         self.traj_time_emb = SinusoidalPosEmb(embedding_dim)
-        self.hand_embed = nn.Embedding(2, embedding_dim)
 
         # Scene token features from 3D positions only
         self.scene_pos_to_feat = nn.Sequential(
@@ -500,8 +487,8 @@ class TransformerHead(nn.Module):
     def forward(self, traj_feats, trajectory, timesteps, rgb3d_pos):
         """
         Arguments:
-            traj_feats: (B, trajectory_length, nhand, F)
-            trajectory: (B, trajectory_length, nhand, 3+6+X)
+            traj_feats: (B, trajectory_length, F)
+            trajectory: (B, trajectory_length, 3+6+X)
             timesteps: (B, 1)
             # rgb3d_feats: (B, N, F)
             rgb3d_pos: (B, N, 3)
@@ -509,30 +496,19 @@ class TransformerHead(nn.Module):
             # rgb2d_pos: (B, N2d, 3)
             # instr_feats: (B, L, F)
             # instr_pos: (B, L, 3)
-            # proprio_feats: (B, nhist*nhand, F)
+            # proprio_feats: (B, 1, F)
             # fps_scene_feats: (B, M, F), M < N
             # fps_scene_pos: (B, M, 3)
 
         Returns:
-            list of (B, trajectory_length, nhand, 3+6+X)
+            list of (B, trajectory_length, 3+6+X)
         """
-        _, traj_len, nhand, _ = trajectory.shape
-
-        # Trajectory features
-        if nhand > 1:
-            traj_feats = traj_feats + self.hand_embed.weight[None, None]
-
-        # Concatenating the second hand features along the trajectory length dimension, 
-        # this is okay because we have position embeddings to recognize that it is the second hand's trajectory.
-        traj_feats = einops.rearrange(traj_feats, 'b l h c -> b (l h) c')
-        trajectory = einops.rearrange(trajectory, 'b l h c -> b (l h) c')
+        _, traj_len, _ = trajectory.shape
 
         # Trajectory features cross-attend to context features
         traj_time_pos = self.traj_time_emb(
             torch.arange(0, traj_len, device=traj_feats.device)
-        )[None, None].repeat(len(traj_feats), 1, nhand, 1)
-
-        traj_time_pos = einops.rearrange(traj_time_pos, 'b l h c -> b (l h) c')
+        )[None, :]
 
         # traj_feats = self.traj_lang_attention(
         #     seq1=traj_feats,
@@ -590,7 +566,6 @@ class TransformerHead(nn.Module):
 
         return [
             torch.cat((position, rotation, openess), -1)
-                 .unflatten(1, (traj_len, nhand))
         ]
 
     def encode_denoising_timestep(self, timestep):

@@ -8,10 +8,17 @@ import sys
 import torch
 import wandb
 
-from datasets import fetch_dataset_class
-from modeling.policy import fetch_model_class
 from utils.common_utils import str2bool, str_none
-from utils.trainers import fetch_train_tester
+
+# Train Tester:
+from train_tester import BaseTrainTester as TrainTester
+
+# Dataset:
+from datasets.shelf_packing_dataset import ShelfPackingDataset
+
+# Model:
+from modeling.policy.denoise_actor_3d_packing import DenoiseActor
+
 
 # Helper function to find run ID by name
 def find_run_id(project_name, run_name):
@@ -37,27 +44,25 @@ def start_wandb_run(args):
 def parse_arguments():
     parser = argparse.ArgumentParser("Parse arguments for main.py")
     # Tuples: (name, type, default)
+    data_path = '/home/ksaha/Research/ModelBasedPlanning/visplanWM/assets/processed_data/shelf_packing_one_object/data.pth'
     arguments = [
         # Dataset/loader arguments
         ('wandb_project_name', str, "3DFA_Planning"),
-        ('wandb_run_name', str, "run_2"),
-        ('train_data_dir', Path, 'data/zarr_data/train.zarr'),
-        ('eval_data_dir', Path, 'data/zarr_data/val.zarr'),
-        ('train_instructions', Path, 'instructions/peract/instructions_cupboard.json'),
-        ('val_instructions', Path, 'instructions/peract/instructions_cupboard.json'),
-        ('dataset', str, "Peract"),
+        ('wandb_run_name', str, "run_1_shelf_packing_one_object"),
+        ('train_data_dir', Path, data_path),
         ('num_workers', int, 4),
-        ('batch_size', int, 64),     # TODO: Change to 64
-        ('batch_size_val', int, 64),  # TODO: Change to 64
+        ('batch_size', int, 64),     
+        ('batch_size_val', int, 64),  
         ('chunk_size', int, 1),
         ('memory_limit', float, 8),  # cache limit in GB
         # Logging arguments
-        ('base_log_dir', Path, Path(__file__).parent / "train_logs"),
+        # ('base_log_dir', Path, Path(__file__).parent / "train_logs"),
+        ('base_log_dir', Path, "/home/ksaha/Research/ModelBasedPlanning/visplanWM/models/3dfa/train_logs"),
         # Training and testing arguments
         ('checkpoint', str_none, 'checkpoints'),  # TODO: Change to checkpoint file if it is there
         ('val_freq', int, 100),
-        ('vis_freq', int, 1000),
-        ('interm_ckpt_freq', int, 1000000),
+        ('vis_freq', int, 1000),            # NOTE: Should be a multiple of val_freq
+        ('interm_ckpt_freq', int, 3000),       # NOTE: Should be a multiple of val_freq
         ('eval_only', str2bool, False),
         ('lr', float, 1e-4),
         ('backbone_lr', float, 1e-4),
@@ -87,7 +92,7 @@ def parse_arguments():
         # Model arguments: head
         ('num_shared_attn_layers', int, 4),
         ('relative_action', str2bool, False),
-        ('rotation_format', str, 'quat_xyzw'),
+        ('rotation_format', str, 'quat_wxyz'),
         ('denoise_timesteps', int, 10),
         ('denoise_model', str, "rectified_flow")
     ]
@@ -134,14 +139,16 @@ if __name__ == '__main__':
     # torch.backends.cudnn.allow_tf32 = True
 
     # Select dataset and model classes
-    dataset_class = fetch_dataset_class(args.dataset)
-    model_class = fetch_model_class(args.model_type)
+    # dataset_class = fetch_dataset_class(args.dataset)
+    # model_class = fetch_model_class(args.model_type)
 
-    # Run
-    TrainTester = fetch_train_tester(args.dataset)
-    train_tester = TrainTester(args, dataset_class, model_class)
+    train_tester = TrainTester(
+        args=args, 
+        dataset_cls=ShelfPackingDataset, 
+        model_cls=DenoiseActor
+    )
 
-    # start_wandb_run(args)
+    start_wandb_run(args)
     train_tester.main()
 
     # Safe program termination

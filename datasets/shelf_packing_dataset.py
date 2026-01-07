@@ -55,6 +55,7 @@ class ShelfPackingDataset(Dataset):
         # Wrap index to handle dataset copies
         idx = idx % self.num_samples
 
+        # TODO: Hard-coding here to have predictions relative to robot base frame (useful for sim2real transfer later)
         input_pcd = copy.deepcopy(self.data['input_pcd'][idx].unsqueeze(0))
         input_pcd[..., 0] = input_pcd[..., 0] + 0.615
         goal_poses = copy.deepcopy(self.data['goal_poses'][idx].unsqueeze(0))
@@ -64,7 +65,8 @@ class ShelfPackingDataset(Dataset):
             return {"action": goal_poses}  # tensor(b, 2, 8) for now
         return {
             "pcd": input_pcd,     # tensor(b, 4096, 3) for now
-            "action": goal_poses,  # tensor(b, 2, 8) for now
+            "action": goal_poses,  # tensor(b, 1, 8) for now
+            "proprioception": self._get_proprioception(idx),  # tensor(b, 1, 8) for now
         }
 
     def __len__(self):
@@ -83,8 +85,8 @@ class ShelfPackingDataset(Dataset):
     # def _get_depth(self, idx, key='depth'):
     #     return self._get_attr_by_idx(idx, key, True)
 
-    # def _get_proprioception(self, idx):
-    #     return self._get_attr_by_idx(idx, 'proprioception', False)
+    def _get_proprioception(self, idx):
+        return self._get_attr_by_idx(idx, 'proprioception', False)
 
     # def _get_action(self, idx):
     #     if self._relative_action:

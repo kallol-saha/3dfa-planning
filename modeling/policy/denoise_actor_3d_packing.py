@@ -21,6 +21,7 @@ class DenoiseActor(nn.Module):
                  # Encoder and decoder arguments
                  embedding_dim=60,
                  num_attn_heads=8,
+                 nhist=1,         # History for Proprioception
                  # Decoder arguments
                  num_shared_attn_layers=4,
                  relative=False,
@@ -45,6 +46,7 @@ class DenoiseActor(nn.Module):
         # Action decoder, runs at every denoising timestep
         self.prediction_head = TransformerHead(
             embedding_dim=embedding_dim,
+            nhist=nhist,
             num_attn_heads=num_attn_heads,
             num_shared_attn_layers=num_shared_attn_layers
         )
@@ -333,6 +335,7 @@ class DenoiseActor(nn.Module):
         self,
         gt_trajectory,
         pcd,
+        proprioception,         # The current gripper pose for the placement policy
         run_inference=False
     ):
         """
@@ -368,6 +371,7 @@ class TransformerHead(nn.Module):
                  embedding_dim=60,
                  num_attn_heads=8,
                  num_shared_attn_layers=4,
+                 nhist=1,
                  rotary_pe=True,
                  rot_dim=6):
         super().__init__()
@@ -380,7 +384,7 @@ class TransformerHead(nn.Module):
             nn.Linear(embedding_dim, embedding_dim)
         )
         self.curr_gripper_emb = nn.Sequential(
-            nn.Linear(embedding_dim, embedding_dim),
+            nn.Linear(embedding_dim * nhist, embedding_dim),
             nn.ReLU(),
             nn.Linear(embedding_dim, embedding_dim)
         )

@@ -47,7 +47,7 @@ class BaseTrainTester:
         self.get_model()
 
         # TODO: Can this be automated?
-        self.scene_bounds = torch.tensor([0., -0.8, -0.1, 
+        self.scene_bounds = torch.tensor([-1.0, -0.8, -0.1, 
                              1.,  0.8,  1.0])        # [x_min, y_min, z_min, x_max, y_max, z_max]
 
     def get_loaders(self):
@@ -231,7 +231,7 @@ class BaseTrainTester:
     def main(self):
         """Run main training/testing pipeline."""
 
-        self.tokenizer = fetch_tokenizers(self.args.backbone)
+        # self.tokenizer = fetch_tokenizers(self.args.backbone)
         if not os.path.exists(self.args.checkpoint):
             normalizer = self.get_workspace_normalizer()
             self.model.workspace_normalizer.copy_(normalizer)
@@ -328,17 +328,19 @@ class BaseTrainTester:
         return (
             sample["action"],
             sample["pcd"],
+            sample["proprioception"],
         )
 
     def _model_forward(self, sample, training=True):
-        action, pcds = self.prepare_batch(
+        action, pcds, proprioception = self.prepare_batch(
             sample, augment=training
         )
         action = action.cuda(non_blocking=True).float()
         pcds = pcds.cuda(non_blocking=True).float()
+        proprioception = proprioception.cuda(non_blocking=True).float()
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             out = self.model(
-                action, pcds,
+                action, pcds, proprioception,
                 run_inference=not training
             )
         return out  # loss if training, else action

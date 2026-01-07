@@ -86,7 +86,11 @@ class ShelfPackingDataset(Dataset):
     #     return self._get_attr_by_idx(idx, key, True)
 
     def _get_proprioception(self, idx):
-        return self._get_attr_by_idx(idx, 'proprioception', False)
+        """Get proprioception (current gripper pose) for the given index."""
+        proprio = copy.deepcopy(self.data['proprioception'][idx].unsqueeze(0))
+        # Apply same offset as input_pcd and goal_poses
+        proprio[..., 0] = proprio[..., 0] + 0.615
+        return proprio  # (1, nhist, 8) or (1, 1, 8) for single proprio
 
     # def _get_action(self, idx):
     #     if self._relative_action:

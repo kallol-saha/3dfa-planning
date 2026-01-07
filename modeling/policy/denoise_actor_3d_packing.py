@@ -21,7 +21,8 @@ class DenoiseActor(nn.Module):
                  # Encoder and decoder arguments
                  embedding_dim=60,
                  num_attn_heads=8,
-                 nhist=1,         # History for Proprioception
+                 nhist=1,         # History length for Proprioception
+                 proprio_dim=8,   # Proprioception dimension (3 pos + 4 quat + 1 gripper)
                  # Decoder arguments
                  num_shared_attn_layers=4,
                  relative=False,
@@ -37,20 +38,21 @@ class DenoiseActor(nn.Module):
         self._relative = relative
         self._lv2_batch_size = lv2_batch_size
 
+        # Proprioception encoder: projects (B, nhist, proprio_dim) -> (B, 1, embedding_dim)
+        self.proprio_encoder = nn.Linear(proprio_dim, embedding_dim)
+        self.proprio_aggregator = nn.Sequential(
+            nn.Linear(embedding_dim * nhist, embedding_dim),
+            nn.ReLU(),
+            nn.Linear(embedding_dim, embedding_dim)
+        )
+
         # Action decoder, runs at every denoising timestep
         self.traj_encoder = nn.Linear(
             6 if rotation_format == 'euler' else 9,  # XYZ + Euler or 6D
             embedding_dim
         )
 
-        # Action decoder, runs at every denoising timestep
-        self.prediction_head = TransformerHead(
-            embedding_dim=embedding_dim,
-            nhist=nhist,
-            num_attn_heads=num_attn_heads,
-            num_shared_attn_layers=num_shared_attn_layers
-        )
-        
+        # Prediction head for denoising
         self.prediction_head = TransformerHead(
             embedding_dim=embedding_dim,
             num_attn_heads=num_attn_heads,
@@ -111,17 +113,16 @@ class DenoiseActor(nn.Module):
         )
         return pcd
 
-    def policy_forward_pass(self, trajectory, timestep, pcd):
-        # Parse inputs
-        # (
-        #     query_trajectory,
-        #     rgb3d_feats, pcd,
-        #     rgb2d_feats, rgb2d_pos,
-        #     instr_feats, instr_pos,
-        #     proprio_feats,
-        #     fps_scene_feats, fps_scene_pos
-        # ) = fixed_inputs
+    def policy_forward_pass(self, trajectory, timestep, pcd, proprio_feats):
+        """
+        Forward pass through the denoising prediction head.
 
+        Args:
+            trajectory: (B, traj_len, 9) - noisy trajectory (pos + 6D rot)
+            timestep: (B,) - denoising timestep
+            pcd: (B, N, 3) - point cloud positions
+            proprio_feats: (B, 1, embedding_dim) - encoded proprioception features
+        """
         # Get features from normalized (relative) trajectory
         trajectory_feats = self.traj_encoder(trajectory)
 
@@ -138,10 +139,20 @@ class DenoiseActor(nn.Module):
             trajectory_feats,
             traj_xyz,
             timestep,
-            rgb3d_pos=pcd
+            rgb3d_pos=pcd,
+            proprio_feats=proprio_feats
         )
 
-    def conditional_sample(self, trajectory, device, pcd):
+    def conditional_sample(self, trajectory, device, pcd, proprio_feats):
+        """
+        Iterative denoising to generate trajectory.
+
+        Args:
+            trajectory: (B, traj_len, 9) - initial noisy trajectory
+            device: torch device
+            pcd: (B, N, 3) - point cloud positions
+            proprio_feats: (B, 1, embedding_dim) - encoded proprioception features
+        """
         # Set schedulers
         self.position_scheduler.set_timesteps(self.n_steps, device=device)
         self.rotation_scheduler.set_timesteps(self.n_steps, device=device)
@@ -152,7 +163,8 @@ class DenoiseActor(nn.Module):
             out = self.policy_forward_pass(
                 trajectory,
                 t * torch.ones(len(trajectory)).to(device).long(),
-                pcd
+                pcd,
+                proprio_feats
             )
             out = out[-1]  # keep only last layer's output
             pos = self.position_scheduler.step(
@@ -167,42 +179,45 @@ class DenoiseActor(nn.Module):
 
         return torch.cat((trajectory, out[..., -1:]), -1)
 
-    def compute_trajectory(self, pcd):
-        # Prepare point cloud positions only
-        # pcd = self.downsample_pcd(pcd, height = 32, width = 32)
+    def compute_trajectory(self, pcd, proprio_feats):
+        """
+        Generate trajectory from noise via iterative denoising.
 
+        Args:
+            pcd: (B, N, 3) - point cloud positions
+            proprio_feats: (B, 1, embedding_dim) - encoded proprioception features
+
+        Returns:
+            trajectory: (B, 1, 8) - predicted trajectory (pos + quat + gripper)
+        """
         # Sample from learned model starting from noise
         out_dim = 6 if self._rotation_format == 'euler' else 9
         trajectory = torch.randn(
-            size=(pcd.shape[0], 2, out_dim),        # TODO: trajectory length is hardcoded to 2 for now.
+            size=(pcd.shape[0], 1, out_dim),  # Single action prediction
             device=pcd.device
         )
         trajectory = self.conditional_sample(
             trajectory,
             device=pcd.device,
-            pcd=pcd
+            pcd=pcd,
+            proprio_feats=proprio_feats
         )
 
         # Back to quaternion
-        trajectory = self.unconvert_rot(
-            trajectory
-        )
+        trajectory = self.unconvert_rot(trajectory)
         # unnormalize position
         trajectory = self.unnormalize_pos(trajectory)
-        # Convert gripper status to probaility
+        # Convert gripper status to probability
         trajectory[..., -1] = trajectory[..., -1].sigmoid()
 
         return trajectory
 
-    def compute_loss(self, gt_trajectory, pcd):
+    def compute_loss(self, gt_trajectory, pcd, proprio_feats):
         """
         gt_trajectory: (B, trajectory_length, 3+4+1)        NOTE: Quaternion (wxyz) will be converted to 6D internally in the function.
         pcd: (B, 4096, 3) in world coordinates
+        proprio_feats: (B, 1, embedding_dim) encoded proprioception features
         """
-        # Encode observations, states, instructions
-
-        # pcd = self.downsample_pcd(pcd, height = 32, width = 32)
-
         # Process gt_trajectory
         gt_openess = gt_trajectory[..., -1:]
         gt_trajectory = gt_trajectory[..., :-1]
@@ -215,7 +230,7 @@ class DenoiseActor(nn.Module):
         # Trick to effectively increase the batch size without re-encoding
         # It speeds up training but may decrease performance a bit
         total_loss = 0
-        for _ in range(self._lv2_batch_size):   # TODO: Why is this not parallelized?
+        for _ in range(self._lv2_batch_size):
             # Sample noise
             noise = torch.randn(gt_trajectory.shape, device=gt_trajectory.device)
 
@@ -238,7 +253,7 @@ class DenoiseActor(nn.Module):
             # Predict the noise residual
             pred = self.policy_forward_pass(
                 noisy_trajectory,
-                timesteps, pcd
+                timesteps, pcd, proprio_feats
             )
 
             # Compute loss
@@ -331,17 +346,36 @@ class DenoiseActor(nn.Module):
             signal = torch.cat((signal, res), -1)
         return signal
 
+    def encode_proprio(self, proprio):
+        """
+        Encode proprioception input.
+
+        Args:
+            proprio: (B, nhist, proprio_dim) - proprioception history
+
+        Returns:
+            proprio_feats: (B, 1, embedding_dim) - encoded proprioception features
+        """
+        # Project each timestep to embedding dim
+        proprio_feats = self.proprio_encoder(proprio)  # (B, nhist, embedding_dim)
+        # Flatten and aggregate across history
+        proprio_feats = proprio_feats.flatten(1, 2)    # (B, nhist * embedding_dim)
+        proprio_feats = self.proprio_aggregator(proprio_feats)  # (B, embedding_dim)
+        proprio_feats = proprio_feats.unsqueeze(1)     # (B, 1, embedding_dim)
+        return proprio_feats
+
     def forward(
         self,
         gt_trajectory,
         pcd,
-        proprioception,         # The current gripper pose for the placement policy
+        proprioception,         # The current gripper pose for the placement policy (B, nhist, 8)
         run_inference=False
     ):
         """
         Arguments:
             gt_trajectory: (B, trajectory_length, 3+4+X)
-            pcd: (B, num_3d_cameras, 3, H, W) in world coordinates
+            pcd: (B, N, 3) point cloud in world coordinates
+            proprioception: (B, nhist, 8) current gripper pose(s)
 
         Note:
             The input rotation is expressed either as:
@@ -352,17 +386,15 @@ class DenoiseActor(nn.Module):
             - loss: scalar, if run_inference is False
             - trajectory: (B, trajectory_length, 3+rot+1), at inference
         """
+        # Encode proprioception
+        proprio_feats = self.encode_proprio(proprioception)
+
         # Inference, don't use gt_trajectory
         if run_inference:
-            return self.compute_trajectory(
-                pcd     # TODO: trajectory_mask is not used here, change the function.
-            )
+            return self.compute_trajectory(pcd, proprio_feats)
 
         # Training, use gt_trajectory to compute loss
-        return self.compute_loss(
-            gt_trajectory,
-            pcd
-        )
+        return self.compute_loss(gt_trajectory, pcd, proprio_feats)
 
 
 class TransformerHead(nn.Module):
@@ -484,25 +516,14 @@ class TransformerHead(nn.Module):
             nn.Linear(embedding_dim, 1)
         )
 
-    # def forward(self, traj_feats, trajectory, timesteps,
-    #             rgb3d_feats, rgb3d_pos, rgb2d_feats, rgb2d_pos,
-    #             instr_feats, instr_pos, proprio_feats,
-    #             fps_scene_feats, fps_scene_pos):
-    def forward(self, traj_feats, trajectory, timesteps, rgb3d_pos):
+    def forward(self, traj_feats, trajectory, timesteps, rgb3d_pos, proprio_feats):
         """
         Arguments:
             traj_feats: (B, trajectory_length, F)
             trajectory: (B, trajectory_length, 3+6+X)
             timesteps: (B, 1)
-            # rgb3d_feats: (B, N, F)
             rgb3d_pos: (B, N, 3)
-            # rgb2d_feats: (B, N2d, F)
-            # rgb2d_pos: (B, N2d, 3)
-            # instr_feats: (B, L, F)
-            # instr_pos: (B, L, 3)
-            # proprio_feats: (B, 1, F)
-            # fps_scene_feats: (B, M, F), M < N
-            # fps_scene_pos: (B, M, 3)
+            proprio_feats: (B, 1, F) - encoded proprioception features
 
         Returns:
             list of (B, trajectory_length, 3+6+X)
@@ -514,16 +535,15 @@ class TransformerHead(nn.Module):
             torch.arange(0, traj_len, device=traj_feats.device)
         )[None, :]
 
-        # traj_feats = self.traj_lang_attention(
-        #     seq1=traj_feats,
-        #     seq2=instr_feats,
-        #     seq1_sem_pos=traj_time_pos, seq2_sem_pos=None
-        # )[-1]
-        
+        # Add time positional embedding to trajectory features
         traj_feats = traj_feats + traj_time_pos
+
+        # Add proprioception features to trajectory features (broadcast across traj_len)
+        traj_feats = traj_feats + proprio_feats  # proprio_feats: (B, 1, F) broadcasts to (B, traj_len, F)
+
         traj_xyz = trajectory[..., :3]
 
-        # Denoising timestep embeddings (no proprioception dependency)
+        # Denoising timestep embeddings
         time_embs = self.encode_denoising_timestep(timesteps)
 
         # Positional embeddings (3D rotary PE from positions)

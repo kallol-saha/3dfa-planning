@@ -58,7 +58,10 @@ class ShelfPackingDataset(Dataset):
         # TODO: Hard-coding here to have predictions relative to robot base frame (useful for sim2real transfer later)
         input_pcd = copy.deepcopy(self.data['input_pcd'][idx].unsqueeze(0))
         input_pcd[..., 0] = input_pcd[..., 0] + 0.615
-        goal_poses = copy.deepcopy(self.data['goal_poses'][idx].unsqueeze(0))
+        goal_poses = copy.deepcopy(self.data['goal_pose'][idx].unsqueeze(0))
+        # Ensure goal_poses has a middle dimension: (B, 8) -> (B, 1, 8)
+        if goal_poses.dim() == 2:
+            goal_poses = goal_poses.unsqueeze(1)
         goal_poses[..., 0] = goal_poses[..., 0] + 0.615
         
         if self._actions_only:
@@ -88,6 +91,9 @@ class ShelfPackingDataset(Dataset):
     def _get_proprioception(self, idx):
         """Get proprioception (current gripper pose) for the given index."""
         proprio = copy.deepcopy(self.data['proprioception'][idx].unsqueeze(0))
+        # Ensure proprio has a middle dimension: (B, 8) -> (B, 1, 8)
+        if proprio.dim() == 2:
+            proprio = proprio.unsqueeze(1)
         # Apply same offset as input_pcd and goal_poses
         proprio[..., 0] = proprio[..., 0] + 0.615
         return proprio  # (1, nhist, 8) or (1, 1, 8) for single proprio

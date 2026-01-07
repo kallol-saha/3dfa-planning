@@ -148,7 +148,7 @@ if __name__ == '__main__':
         model_cls=DenoiseActor
     )
 
-    start_wandb_run(args)
+    # start_wandb_run(args)       # NOTE: Comment out here for disabling wandb
     train_tester.main()
 
     # Safe program termination

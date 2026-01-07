@@ -22,7 +22,6 @@ class DenoiseActor(nn.Module):
                  embedding_dim=60,
                  num_attn_heads=8,
                  nhist=1,         # History length for Proprioception
-                 proprio_dim=8,   # Proprioception dimension (3 pos + 4 quat + 1 gripper)
                  # Decoder arguments
                  num_shared_attn_layers=4,
                  relative=False,
@@ -37,11 +36,23 @@ class DenoiseActor(nn.Module):
         self._rotation_format = rotation_format
         self._relative = relative
         self._lv2_batch_size = lv2_batch_size
+        self._nhist = nhist
 
-        # Proprioception encoder: projects (B, nhist, proprio_dim) -> (B, 1, embedding_dim)
-        self.proprio_encoder = nn.Linear(proprio_dim, embedding_dim)
-        self.proprio_aggregator = nn.Sequential(
-            nn.Linear(embedding_dim * nhist, embedding_dim),
+        # Proprioception encoder (like encoder3d)
+        # Learnable embedding for each history step
+        self.curr_gripper_embed = nn.Embedding(nhist, embedding_dim)
+        # 3D rotary positional encoding for proprio positions
+        self.proprio_relative_pe = RotaryPositionEncoding3D(embedding_dim)
+        # Cross-attention from proprio to scene context
+        self.gripper_context_head = AttentionModule(
+            num_layers=3, d_model=embedding_dim, dim_fw=embedding_dim,
+            n_heads=num_attn_heads, rotary_pe=True, use_adaln=False,
+            pre_norm=False
+        )
+        # Scene feature encoder (for proprio context)
+        # TODO: This is a new layer added because originally in 3DFA proprio features will attend to the rgb3d_feats from CLIP 
+        self.scene_pos_to_feat = nn.Sequential(
+            nn.Linear(3, embedding_dim),
             nn.ReLU(),
             nn.Linear(embedding_dim, embedding_dim)
         )
@@ -188,7 +199,7 @@ class DenoiseActor(nn.Module):
             proprio_feats: (B, 1, embedding_dim) - encoded proprioception features
 
         Returns:
-            trajectory: (B, 1, 8) - predicted trajectory (pos + quat + gripper)
+            trajectory: (B, 1, 8) - predicted trajectory (pos + quat + gripper)     NOTE: gripper is 0 for closed and 1 for open
         """
         # Sample from learned model starting from noise
         out_dim = 6 if self._rotation_format == 'euler' else 9
@@ -346,36 +357,48 @@ class DenoiseActor(nn.Module):
             signal = torch.cat((signal, res), -1)
         return signal
 
-    def encode_proprio(self, proprio):
+    def encode_proprio(self, proprio, context_feats, context_pos):
         """
-        Encode proprioception input.
+        Encode proprioception input (like encoder3d).
 
         Args:
-            proprio: (B, nhist, proprio_dim) - proprioception history
+            proprio: (B, nhist, 8) - gripper pose history (pos + quat + gripper)
+            context_feats: (B, N, embedding_dim) - scene features
+            context_pos: (B, N, 3) - scene positions
 
         Returns:
-            proprio_feats: (B, 1, embedding_dim) - encoded proprioception features
+            proprio_feats: (B, nhist, embedding_dim) - encoded proprioception features
         """
-        # Project each timestep to embedding dim
-        proprio_feats = self.proprio_encoder(proprio)  # (B, nhist, embedding_dim)
-        # Flatten and aggregate across history
-        proprio_feats = proprio_feats.flatten(1, 2)    # (B, nhist * embedding_dim)
-        proprio_feats = self.proprio_aggregator(proprio_feats)  # (B, embedding_dim)
-        proprio_feats = proprio_feats.unsqueeze(1)     # (B, 1, embedding_dim)
+
+        # Learnable embedding for proprioception (like encoder3d)
+        proprio_feats = self.curr_gripper_embed.weight.unsqueeze(0).repeat(
+            len(proprio), 1, 1
+        )  # (B, nhist, embedding_dim)
+
+        # Rotary positional encoding
+        proprio_pos = self.proprio_relative_pe(proprio[..., :3])  # Use xyz positions
+        context_pos_encoded = self.proprio_relative_pe(context_pos)
+
+        # Attention to scene tokens
+        proprio_feats = self.gripper_context_head(
+            proprio_feats, context_feats,
+            seq1_pos=proprio_pos, seq2_pos=context_pos_encoded
+        )[-1]
+
         return proprio_feats
 
     def forward(
         self,
         gt_trajectory,
         pcd,
-        proprioception,         # The current gripper pose for the placement policy (B, nhist, 8)
+        proprioception,         # The current gripper pose for the placement policy (B, nhist, 8) or (B, 8)
         run_inference=False
     ):
         """
         Arguments:
             gt_trajectory: (B, trajectory_length, 3+4+X)
             pcd: (B, N, 3) point cloud in world coordinates
-            proprioception: (B, nhist, 8) current gripper pose(s)
+            proprioception: (B, nhist, 8) or (B, 8) current gripper pose(s)
 
         Note:
             The input rotation is expressed either as:
@@ -386,8 +409,11 @@ class DenoiseActor(nn.Module):
             - loss: scalar, if run_inference is False
             - trajectory: (B, trajectory_length, 3+rot+1), at inference
         """
-        # Encode proprioception
-        proprio_feats = self.encode_proprio(proprioception)
+        # Compute scene features for proprio encoding
+        context_feats = self.scene_pos_to_feat(pcd)  # (B, N, embedding_dim)
+
+        # Encode proprioception with scene context (like encoder3d)
+        proprio_feats = self.encode_proprio(proprioception, context_feats, pcd)
 
         # Inference, don't use gt_trajectory
         if run_inference:
@@ -538,13 +564,10 @@ class TransformerHead(nn.Module):
         # Add time positional embedding to trajectory features
         traj_feats = traj_feats + traj_time_pos
 
-        # Add proprioception features to trajectory features (broadcast across traj_len)
-        traj_feats = traj_feats + proprio_feats  # proprio_feats: (B, 1, F) broadcasts to (B, traj_len, F)
-
         traj_xyz = trajectory[..., :3]
 
-        # Denoising timestep embeddings
-        time_embs = self.encode_denoising_timestep(timesteps)
+        # Denoising timestep embeddings (conditioned on proprioception like original 3DFA)
+        time_embs = self.encode_denoising_timestep(timesteps, proprio_feats)
 
         # Positional embeddings (3D rotary PE from positions)
         rel_traj_pos, rel_scene_pos, rel_pos = self.get_positional_embeddings(
@@ -592,12 +615,13 @@ class TransformerHead(nn.Module):
             torch.cat((position, rotation, openess), -1)
         ]
 
-    def encode_denoising_timestep(self, timestep):
+    def encode_denoising_timestep(self, timestep, proprio_feats):
         """
-        Compute denoising timestep features and positional embeddings.
+        Compute denoising timestep features conditioned on proprioception (like original 3DFA).
 
         Args:
             - timestep: (B,) or (B, 1)
+            - proprio_feats: (B, nhist, F)
 
         Returns:
             - time_feats: (B, F)
@@ -605,7 +629,10 @@ class TransformerHead(nn.Module):
         if timestep.dim() > 1:
             timestep = timestep.squeeze(-1)
         time_feats = self.time_emb(timestep)
-        return time_feats
+        # Flatten proprio and project through curr_gripper_emb
+        proprio_flat = proprio_feats.flatten(1)  # (B, nhist * F)
+        curr_gripper_feats = self.curr_gripper_emb(proprio_flat)  # (B, F)
+        return time_feats + curr_gripper_feats
 
     def get_positional_embeddings(
         self,

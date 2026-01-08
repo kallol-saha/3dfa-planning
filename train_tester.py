@@ -311,7 +311,7 @@ class BaseTrainTester:
 
                 new_loss = metrics['train-losses/mean/traj_pos_l2']
 
-                # wandb.log(metrics)      # NOTE: Comment out here for disabling wandb
+                wandb.log(metrics)      # NOTE: Comment out here for disabling wandb
 
                 # save model
                 best_loss = self.save_checkpoint(

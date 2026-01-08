@@ -48,7 +48,7 @@ def parse_arguments():
     arguments = [
         # Dataset/loader arguments
         ('wandb_project_name', str, "3DFA_Planning"),
-        ('wandb_run_name', str, "trial_run_placement_policy"),
+        ('wandb_run_name', str, "placement_policy_run_2"),
         ('train_data_dir', Path, data_path),
         ('num_workers', int, 4),
         ('batch_size', int, 64),     
@@ -148,7 +148,7 @@ if __name__ == '__main__':
         model_cls=DenoiseActor
     )
 
-    # start_wandb_run(args)       # NOTE: Comment out here for disabling wandb
+    start_wandb_run(args)       # NOTE: Comment out here for disabling wandb
     train_tester.main()
 
     # Safe program termination

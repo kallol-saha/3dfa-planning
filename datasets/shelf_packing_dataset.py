@@ -4,6 +4,7 @@ import copy
 from .utils import to_tensor, read_zarr_with_cache, to_relative_action
 import torch
 from .base import BaseDataset
+from robo_utils.visualization.plotting import plot_pcd, visualize_poses_in_pointcloud
 
 from torch.utils.data import Dataset
 
@@ -63,6 +64,11 @@ class ShelfPackingDataset(Dataset):
         if goal_poses.dim() == 2:
             goal_poses = goal_poses.unsqueeze(1)
         goal_poses[..., 0] = goal_poses[..., 0] + 0.615
+
+        value = copy.deepcopy(self.data['value'][idx].unsqueeze(0))
+
+        # For visualization only:
+        # visualize_poses_in_pointcloud(input_pcd[0].cpu().numpy(), torch.cat([goal_poses[0], self._get_proprioception(idx)[0]], axis=0), colors=([0, 1, 0], [0, 0, 1]))
         
         if self._actions_only:
             return {"action": goal_poses}  # tensor(b, 2, 8) for now
@@ -70,7 +76,10 @@ class ShelfPackingDataset(Dataset):
             "pcd": input_pcd,     # tensor(b, 4096, 3) for now
             "action": goal_poses,  # tensor(b, 1, 8) for now
             "proprioception": self._get_proprioception(idx),  # tensor(b, 1, 8) for now
+            "value": value,  # tensor(b, 1) for now
         }
+
+
 
     def __len__(self):
         return self.copies * self.num_samples

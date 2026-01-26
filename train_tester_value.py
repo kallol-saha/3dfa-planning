@@ -1,0 +1,574 @@
+from copy import deepcopy
+import os
+import random
+
+import numpy as np
+import torch
+from torch import optim
+from torch.utils.data.distributed import DistributedSampler
+from torch import nn
+import torch.distributed as dist
+from torch.utils.data import DataLoader
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import trange, tqdm
+import wandb
+
+from modeling.encoder.text import fetch_tokenizers
+from utils.common_utils import count_parameters
+from utils.depth2cloud import fetch_depth2cloud
+from utils.data_preprocessors import fetch_data_preprocessor
+from utils.ema import EMA
+from utils.schedulers import fetch_scheduler
+from utils.trainers.utils import compute_metrics, visualize_pred_gt
+
+
+class BaseTrainTester:
+    """Train/test a trajectory optimization algorithm."""
+
+    def __init__(self, args, dataset_cls, model_cls):
+        """Initialize."""
+        self.args = args
+        self.dataset_cls = dataset_cls
+        self.model_cls = model_cls
+
+        # self.preprocessor = fetch_data_preprocessor(self.args.dataset)(
+        #     self.args.keypose_only,
+        #     self.args.num_history,
+        #     custom_imsize=self.args.custom_img_size,
+        #     depth2cloud=fetch_depth2cloud(self.args.dataset)
+        # )
+
+        # TODO: This has to be replaced with wandb
+        if torch.distributed.is_initialized() and dist.get_rank() == 0 and not self.args.eval_only:
+            self.writer = SummaryWriter(log_dir=args.log_dir)
+
+        self.get_loaders()
+        self.get_model()
+
+        # TODO: Can this be automated?
+        self.scene_bounds = torch.tensor([-1.0, -0.8, -0.1, 
+                             1.,  0.8,  1.0])        # [x_min, y_min, z_min, x_max, y_max, z_max]
+
+    def get_loaders(self):
+
+        """Initialize data loaders."""
+
+        # Function to seed the random number generator for each worker
+        def seed_worker(worker_id):
+            worker_seed = torch.initial_seed() % 2**32
+            np.random.seed(worker_seed)
+            random.seed(worker_seed)
+
+        # Initialize the training dataset
+        self.train_dataset = self.dataset_cls(
+            root=self.args.train_data_dir,
+            relative_action=self.args.relative_action,
+            mem_limit=self.args.memory_limit,
+        )
+
+        # Initialize the random number generator for torch data loader
+        g = torch.Generator()
+        g.manual_seed(0)
+
+        # Initialize the training data loader
+        self.train_loader = DataLoader(
+            self.train_dataset,                                              # The torch dataset object containing the data
+            batch_size=self.args.batch_size,    # The training batch size
+            shuffle=True,                                               # Whether to shuffle the data each epoch
+            num_workers=self.args.num_workers,                          # Number of CPU subprocesses to use for data loading
+            worker_init_fn=seed_worker,                                 # Function to seed the random number generator for each worker  
+            collate_fn=base_collate_fn,                                 # Function to merge a list of samples into a mini-batch.
+            pin_memory=True,                                            # If True, the DataLoader will copy tensors into CUDA pinned memory before returning them
+            drop_last=True,                                             # Whether to drop the last batch if it is not of the same size as the other batches
+            generator=g,                                                # The random number generator to use for the data loading
+            prefetch_factor=4,                                          # The number of batches to prefetch from the data loader
+            persistent_workers=True                                     # Whether to keep the workers alive after the data loading is complete
+        )
+       
+        return self.train_loader
+
+    def get_model(self):
+        """Initialize the model."""
+        # Initialize model with arguments (ValueNetwork specific)
+        self.model = self.model_cls(
+            embedding_dim=self.args.embedding_dim,
+            num_attn_heads=self.args.num_attn_heads,
+            nhist=getattr(self.args, 'nhist', 1),
+            num_shared_attn_layers=self.args.num_shared_attn_layers
+        )
+
+        # Print basic modules' parameters
+        count_parameters(self.model)
+
+        # Useful for some models to ensure parameters are contiguous
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and param.ndim > 1 and not param.is_contiguous():
+                print(f"Fixing layout for: {name}")
+                param.data = param.contiguous()
+
+        return self.model
+
+    @torch.no_grad()
+    def get_workspace_normalizer(self, ndims=3):
+        """
+        Computes workspace bounds (min/max) for position normalization by iterating through
+        all training actions and finding the minimum and maximum values across the first `ndims`
+        dimensions (typically 3 for x, y, z position coordinates).
+        
+        The bounds are extended by a buffer margin (workspace_normalizer_buffer) to ensure
+        workspace coverage during training/inference. The returned normalizer can be used to
+        normalize 3D positions to a standard range (typically [-1, 1]) for neural network training.
+        
+        Args:
+            ndims: Number of dimensions to compute bounds for (default: 3 for x, y, z positions)
+        
+        Returns:
+            nn.Parameter: A 2xndims tensor where:
+                - First row contains minimum values for each dimension (with buffer subtracted)
+                - Second row contains maximum values for each dimension (with buffer added)
+                Shape: (2, ndims), requires_grad=False
+        """
+        # print("Computing workspace normalizer...")
+
+        # # Initialize datasets with arguments
+        # train_dataset = self.dataset_cls(
+        #     root=self.args.train_data_dir,
+        #     instructions=self.args.train_instructions,
+        #     copies=1,
+        #     relative_action=self.args.relative_action,
+        #     mem_limit=0.1,
+        #     actions_only=True,
+        #     chunk_size=self.args.chunk_size
+        # )
+
+        # data_loader = DataLoader(
+        #     train_dataset,
+        #     batch_size=max(self.args.batch_size, 64) // self.args.chunk_size,
+        #     collate_fn=actions_collate_fn,
+        #     shuffle=False,
+        #     num_workers=self.args.num_workers
+        # )
+
+        # # Loop and compute action min-max
+        # min_, max_ = torch.ones(ndims) * 10000, -torch.ones(ndims) * 10000
+        # for sample in tqdm(data_loader):
+        #     action = sample["action"][..., :ndims].reshape([-1, ndims])
+        #     min_ = torch.min(min_, action.min(0).values)
+        #     max_ = torch.max(max_, action.max(0).values)
+
+        # min_ = min_ - self.args.workspace_normalizer_buffer
+        # max_ = max_ + self.args.workspace_normalizer_buffer
+
+        # This is a (2, 3) shape tensor for min and max values for x, y, z positions of the workspace
+        return nn.Parameter(
+            torch.stack([
+                self.scene_bounds[:3], 
+                self.scene_bounds[3:]
+            ]),
+            requires_grad=False
+        )
+
+    def get_optimizer(self):
+        """
+        Initializes an AdamW optimizer with separate parameter groups for different types of parameters:
+        
+        - Group 0: Parameters that do not require gradients (e.g., frozen weights)
+        - Group 1: Parameters that require gradients and are not part of the backbone (e.g., model weights)
+        - Group 2: Parameters that require gradients and are part of the backbone (e.g., backbone weights)
+        
+        The optimizer is configured with specified learning rates and weight decay rates for each group.
+        """
+        optimizer_grouped_parameters = [
+            {"params": [], "weight_decay": 0.0, "lr": self.args.lr},
+            {"params": [], "weight_decay": self.args.wd, "lr": self.args.lr}
+        ]
+        if self.args.finetune_backbone:
+            optimizer_grouped_parameters.append({
+                "params": [], "weight_decay": self.args.wd,
+                "lr": self.args.backbone_lr
+            })
+
+        # Collect names of all norm parameters
+        norm_types = (
+            torch.nn.BatchNorm1d,
+            torch.nn.BatchNorm2d,
+            torch.nn.BatchNorm3d,
+            torch.nn.LayerNorm,
+            torch.nn.GroupNorm,
+            torch.nn.InstanceNorm1d,
+            torch.nn.InstanceNorm2d,
+            torch.nn.InstanceNorm3d,
+            torch.nn.LocalResponseNorm,
+            torch.nn.RMSNorm
+        )
+        norm_param_names = set()
+        for module_name, module in self.model.named_modules():
+            if isinstance(module, norm_types):
+                for param_name, _ in module.named_parameters(recurse=False):
+                    norm_param_names.add(f"{module_name}.{param_name}")
+
+        # Now split parameters based on name
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if name in norm_param_names or name.endswith(".bias"):
+                optimizer_grouped_parameters[0]["params"].append(param)
+            elif self.args.finetune_backbone and 'backbone' in name:
+                optimizer_grouped_parameters[2]["params"].append(param)
+            else:
+                optimizer_grouped_parameters[1]["params"].append(param)
+        self.optimizer = optim.AdamW(
+            optimizer_grouped_parameters,
+            betas=(0.9, 0.95)
+        )
+        return self.optimizer
+
+    def main(self):
+        """Run main training/testing pipeline."""
+
+        # self.tokenizer = fetch_tokenizers(self.args.backbone)
+        # ValueNetwork doesn't need workspace_normalizer
+
+        # Initialize the optimizer
+        self.optimizer = self.get_optimizer()
+        lr_scheduler = fetch_scheduler(
+            self.args.lr_scheduler, self.optimizer, self.args.train_iters
+        )
+        scaler = torch.GradScaler()
+
+        # Move model to devices
+        if torch.cuda.is_available():
+            self.model = self.model.cuda()
+        # ValueNetwork doesn't have compute_loss method, forward handles both training and inference
+
+        # Initialize EMA copy
+        ema_model = deepcopy(self.model)
+        self.ema = EMA()
+
+        # Check for a checkpoint
+        start_iter, best_loss = 0, None
+        if self.args.checkpoint:
+            start_iter, best_loss = self.load_checkpoint(self.model, ema_model, self.optimizer)
+
+        # Eval only
+        if self.args.eval_only:
+            print("Test evaluation.......")
+            self.model.eval()
+            # Use train_loader for evaluation if val_loader doesn't exist
+            eval_loader = getattr(self, 'val_loader', None) or self.train_loader
+            self.evaluate_nsteps(
+                ema_model if self.args.use_ema else self.model,
+                eval_loader, step_id=-1,
+                val_iters=-1
+            )
+            return ema_model if self.args.use_ema else self.model
+
+        # Step the lr scheduler to the current step
+        for _ in range(start_iter):
+            lr_scheduler.step()
+
+        # Step the sampler to the currect "epoch"
+        samples_per_epoch = len(self.train_loader)
+        epoch = start_iter // samples_per_epoch + 1
+
+        # Training loop
+        self.model.train()
+        iter_loader = iter(self.train_loader)
+        for step_id in trange(start_iter, self.args.train_iters):
+            try:
+                sample = next(iter_loader)
+            except StopIteration:
+                # when the iterator is exhausted, we need to reset it
+                # and increment the epoch
+                epoch += 1
+                iter_loader = iter(self.train_loader)
+                sample = next(iter_loader)
+
+            self.train_one_step(scaler, lr_scheduler, sample)
+            self.ema.step(self.model, ema_model, self.args.use_ema, step_id)
+
+            if (step_id + 1) % self.args.val_freq == 0:
+
+                # !!! NOTE This is where evaluation happens
+                print("Train evaluation.......")
+
+                self.model.eval()
+
+                metrics = self.evaluate_nsteps(
+                    ema_model if self.args.use_ema else self.model,
+                    self.train_loader, step_id,
+                    val_iters=10,
+                    split='train'
+                )
+
+                new_loss = metrics['train-losses/mean/value_mse']
+
+                wandb.log(metrics)      # NOTE: Comment out here for disabling wandb
+
+                # save model
+                best_loss = self.save_checkpoint(
+                    self.model, ema_model, self.optimizer, step_id,
+                    new_loss, best_loss
+                )
+                self.model.train()
+
+        return ema_model if self.args.use_ema else self.model
+
+    @torch.no_grad()
+    def prepare_batch(self, sample, augment=False):
+        """Prepare batch for ValueNetwork: returns value (target), pcd, proprioception."""
+        return (
+            sample.get("value", None),  # Target value for training (B,) or (B, 1)
+            sample["pcd"],
+            sample["proprioception"],
+        )
+
+    def _model_forward(self, sample, training=True):
+        """Forward pass for ValueNetwork."""
+        target_value, pcd, proprioception = self.prepare_batch(
+            sample, augment=training
+        )
+        pcd = pcd.cuda(non_blocking=True).float()
+        proprioception = proprioception.cuda(non_blocking=True).float()
+        
+        # Prepare target_value for training
+        if training and target_value is not None:
+            target_value = target_value.cuda(non_blocking=True).float()
+        elif training:
+            raise ValueError("target_value is required for training")
+        else:
+            target_value = None  # Inference mode
+        
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            out = self.model(
+                pcd=pcd,
+                proprioception=proprioception,
+                target_value=target_value
+            )
+        return out  # loss if training, else value (B, 1)
+
+    def train_one_step(self, scaler, lr_scheduler, sample):
+        """Run a single training step."""
+        self.optimizer.zero_grad()
+
+        # Forward pass
+        loss = self._model_forward(sample)
+
+        # Backward pass
+        scaler.scale(loss).backward()
+
+        # Clip gradients
+        scaler.unscale_(self.optimizer)
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 10.0)
+
+        # Update
+        scaler.step(self.optimizer)
+        scaler.update()
+
+        # Step the lr scheduler
+        lr_scheduler.step()
+
+    @torch.inference_mode()
+    def evaluate_nsteps(self, model, loader, step_id, val_iters, split='val'):
+        """Run a given number of evaluation steps."""
+        metrics_dict = {}
+        device = next(model.parameters()).device
+        model.eval()
+
+        all_pred_values = []
+        all_gt_values = []
+
+        for i, sample in tqdm(enumerate(loader)):
+            if i == val_iters:
+                break
+
+            pred_value = self._model_forward(sample, training=False)  # (B, 1)
+            gt_value = sample.get("value", None)
+            
+            if gt_value is None:
+                print(f"Warning: No ground truth value found in sample, skipping metrics")
+                continue
+                
+            gt_value = gt_value.cuda(non_blocking=True).float()
+            
+            # Ensure same shape
+            if gt_value.dim() == 1:
+                gt_value = gt_value.unsqueeze(-1)
+            
+            # Compute value prediction metrics
+            mse = torch.nn.functional.mse_loss(pred_value, gt_value)
+            mae = torch.nn.functional.l1_loss(pred_value, gt_value)
+            
+            # Store metrics
+            if f"{split}-losses/mean/value_mse" not in metrics_dict:
+                metrics_dict[f"{split}-losses/mean/value_mse"] = []
+                metrics_dict[f"{split}-losses/mean/value_mae"] = []
+            
+            metrics_dict[f"{split}-losses/mean/value_mse"].append(mse.item())
+            metrics_dict[f"{split}-losses/mean/value_mae"].append(mae.item())
+            
+            # Collect for visualization
+            all_pred_values.append(pred_value.cpu())
+            all_gt_values.append(gt_value.cpu())
+
+            if (step_id + 1) % self.args.vis_freq == 0:
+                # Save a random visualization for validation
+                if i == 0:  # Only for first batch
+                    B = sample["pcd"].shape[0]
+                    idx = torch.randint(0, B, (1,)).item()
+                    
+                    # Create vis directory if it doesn't exist
+                    vis_dir = os.path.join(self.args.log_dir, "vis")
+                    os.makedirs(vis_dir, exist_ok=True)
+                    
+                    # Convert to numpy and detach from GPU
+                    # Convert bfloat16 to float32 before numpy conversion
+                    pcd_np = sample["pcd"][idx].cpu().detach().float().numpy()
+                    pred_value_np = pred_value[idx].cpu().detach().float().numpy()
+                    gt_value_np = gt_value[idx].cpu().detach().float().numpy()
+                    
+                    # Save as NPZ file
+                    filename = os.path.join(vis_dir, f"step_{(step_id + 1)}.npz")
+                    np.savez_compressed(
+                        filename,
+                        pcd=pcd_np,
+                        pred_value=pred_value_np,
+                        gt_value=gt_value_np,
+                        step_id=(step_id + 1)
+                    )
+                    
+                    print(f"Saved visualization data to: {filename}")
+                    print(f"  PCD shape: {pcd_np.shape}")
+                    print(f"  Pred value: {pred_value_np}")
+                    print(f"  GT value: {gt_value_np}")
+
+        # Average metrics
+        values = {k: np.mean(v) for k, v in metrics_dict.items()}
+        
+        # TODO: Uncomment for distributed training
+        # if dist.get_rank() == 0:
+        # if step_id > -1:
+        #     for key, val in values.items():
+        #         self.writer.add_scalar(key, val, step_id)
+
+        # Also log to terminal
+        print(f"Step {step_id}:")
+        for key, value in values.items():
+            print(f"{key}: {value:.06f}")
+
+        return values
+
+    def load_checkpoint(self, model, ema_model, optimizer):
+        """Load from checkpoint."""
+        print("=> trying checkpoint '{}'".format(self.args.checkpoint))
+        if not os.path.exists(self.args.checkpoint):
+            print('Warning: checkpoint was not found, starting from scratch')
+            print('The main process will compute workspace bounds')
+            return 0, None
+
+        model_dict = torch.load(
+            self.args.checkpoint,
+            map_location="cpu",
+            weights_only=True
+        )
+        # Load weights flexibly
+        msn, unxpct = model.load_state_dict(model_dict["weight"], strict=False)
+        if msn:
+            print(f"Missing keys (not found in checkpoint): {len(msn)}")
+            print(msn)
+        if unxpct:
+            print(f"Unexpected keys (ignored): {len(unxpct)}")
+            print(unxpct)
+        if not msn and not unxpct:
+            print("All keys matched successfully!")
+        # EMA weights
+        if model_dict.get("ema_weight") is not None:
+            ema_model.load_state_dict(model_dict["ema_weight"], strict=True)
+        # Useful for resuming training
+        if 'optimizer' in model_dict and not self.args.eval_only:
+            optimizer.load_state_dict(model_dict["optimizer"])
+        start_iter = model_dict.get("iter", 0)
+        best_loss = model_dict.get("best_loss", None)
+
+        print("=> loaded successfully '{}' (step {})".format(
+            self.args.checkpoint, model_dict.get("iter", 0)
+        ))
+        del model_dict
+        torch.cuda.empty_cache()
+        return start_iter, best_loss
+
+    def save_checkpoint(self, model, ema_model, optimizer,
+                        step_id, new_loss, best_loss):
+        """Save checkpoint if requested."""
+        model_state = model.state_dict()
+        ema_state = ema_model.state_dict() if self.args.use_ema else None
+
+        # Best checkpoint
+        if best_loss is None or new_loss <= best_loss:
+            best_loss = new_loss
+            torch.save({
+                "weight": model_state,
+                "ema_weight": ema_state,
+                "iter": step_id + 1,
+                "best_loss": best_loss
+            }, self.args.log_dir / "best.pth")
+
+        # Last checkpoint (always saved)
+        torch.save({
+            "weight": model_state,
+            "ema_weight": ema_state,
+            "optimizer": optimizer.state_dict(),
+            "iter": step_id + 1,
+            "best_loss": best_loss
+        }, self.args.log_dir / "last.pth")
+
+        # Save intermediate checkpoints
+        if (step_id + 1) % self.args.interm_ckpt_freq == 0:
+            torch.save({
+                "weight": model_state,
+                "ema_weight": ema_state,
+                "iter": step_id + 1,
+                "best_loss": best_loss
+            }, self.args.log_dir / f"interm{step_id + 1}.pth")
+
+        return best_loss
+
+
+def base_collate_fn(batch):
+    """Custom collate_fn, measured to be faster than default."""
+    _dict = {}
+
+    # Values for these come as lists
+    list_keys = ["task", "instr"]
+    for key in list_keys:
+        if key not in batch[0].keys():
+            continue
+        _dict[key] = []
+        for item in batch:
+            _dict[key].extend(item[key])
+
+    # Treat rest as tensors
+    _dict.update({
+        k_: (
+            torch.cat([item[k_] for item in batch])
+            if batch[0][k_] is not None else None
+        )
+        for k_ in batch[0].keys() if k_ not in list_keys
+    })
+
+    return _dict
+
+
+def actions_collate_fn(batch):
+    return {"action": torch.cat([item["action"] for item in batch])}
+
+
+def relative_to_absolute(action, proprio):
+    # action (B, T, 8), proprio (B, 1, 7)
+    pos = proprio[..., :3] + action[..., :3].cumsum(1)
+
+    orn = proprio[..., 3:6] + action[..., 3:6].cumsum(1)
+    orn = (orn + torch.pi) % (2 * torch.pi) - torch.pi
+
+    return torch.cat([pos, orn, action[..., 6:]], -1)

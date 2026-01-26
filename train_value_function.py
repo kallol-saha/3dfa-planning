@@ -11,13 +11,13 @@ import wandb
 from utils.common_utils import str2bool, str_none
 
 # Train Tester:
-from train_tester import BaseTrainTester as TrainTester
+from train_tester_value import BaseTrainTester as TrainTester
 
 # Dataset:
 from datasets.shelf_packing_dataset import ShelfPackingDataset
 
 # Model:
-from modeling.policy.denoise_actor_3d_packing import DenoiseActor
+from modeling.policy.value_network import ValueNetwork
 
 
 # Helper function to find run ID by name
@@ -48,11 +48,11 @@ def parse_arguments():
     arguments = [
         # Dataset/loader arguments
         ('wandb_project_name', str, "3DFA_Planning"),
-        ('wandb_run_name', str, "policy_run_1"),
+        ('wandb_run_name', str, "value_function_run_2"),
         ('train_data_dir', Path, data_path),
         ('num_workers', int, 4),
-        ('batch_size', int, 64),     
-        ('batch_size_val', int, 64),  
+        ('batch_size', int, 32),     
+        ('batch_size_val', int, 32),  
         ('chunk_size', int, 1),
         ('memory_limit', float, 8),  # cache limit in GB
         # Logging arguments
@@ -60,7 +60,7 @@ def parse_arguments():
         ('base_log_dir', Path, "/home/ksaha/Research/ModelBasedPlanning/visplanWM/models/flowmatch_actor/train_logs"),
         # Training and testing arguments
         ('checkpoint', str_none, 'checkpoints'),  # TODO: Change to checkpoint file if it is there
-        ('val_freq', int, 100),
+        ('val_freq', int, 20),
         ('vis_freq', int, 1000),            # NOTE: Should be a multiple of val_freq
         ('interm_ckpt_freq', int, 3000),       # NOTE: Should be a multiple of val_freq
         ('eval_only', str2bool, False),
@@ -145,7 +145,7 @@ if __name__ == '__main__':
     train_tester = TrainTester(
         args=args, 
         dataset_cls=ShelfPackingDataset, 
-        model_cls=DenoiseActor
+        model_cls=ValueNetwork
     )
 
     start_wandb_run(args)       # NOTE: Comment out here for disabling wandb

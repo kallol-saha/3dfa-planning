@@ -16,15 +16,15 @@ class ValueNetwork(nn.Module):
         super().__init__()
         self._nhist = nhist
 
-        # Proprioception encoder
-        self.curr_gripper_embed = nn.Embedding(nhist, embedding_dim)
-        self.proprio_relative_pe = RotaryPositionEncoding3D(embedding_dim)
-        self.gripper_context_head = AttentionModule(
+        # Action encoder
+        self.action_embed = nn.Embedding(nhist, embedding_dim)
+        self.action_relative_pe = RotaryPositionEncoding3D(embedding_dim)
+        self.action_context_head = AttentionModule(
             num_layers=3, d_model=embedding_dim, dim_fw=embedding_dim,
             n_heads=num_attn_heads, rotary_pe=True, use_adaln=False,
             pre_norm=False
         )
-        # Scene feature encoder
+        # Scene feature encoder (single shared encoder)
         self.scene_pos_to_feat = nn.Sequential(
             nn.Linear(3, embedding_dim),
             nn.ReLU(),
@@ -39,72 +39,70 @@ class ValueNetwork(nn.Module):
             nhist=nhist
         )
 
-    def encode_proprio(self, proprio, context_feats, context_pos):
+    def encode_action(self, action, context_feats, context_pos):
         """
-        Encode proprioception input.
+        Encode action input (candidate gripper pose) with scene context.
 
         Args:
-            proprio: (B, nhist, 8) - gripper pose history (pos + quat + gripper)
+            action: (B, nhist, 8) - candidate gripper pose(s) (pos + quat + gripper)
             context_feats: (B, N, embedding_dim) - scene features
             context_pos: (B, N, 3) - scene positions
 
         Returns:
-            proprio_feats: (B, nhist, embedding_dim) - encoded proprioception features
+            action_feats: (B, nhist, embedding_dim) - encoded action features
         """
-        # Learnable embedding for proprioception
-        proprio_feats = self.curr_gripper_embed.weight.unsqueeze(0).repeat(
-            len(proprio), 1, 1
+        # Learnable embedding for action
+        action_feats = self.action_embed.weight.unsqueeze(0).repeat(
+            len(action), 1, 1
         )  # (B, nhist, embedding_dim)
 
         # Rotary positional encoding
-        proprio_pos = self.proprio_relative_pe(proprio[..., :3])
-        context_pos_encoded = self.proprio_relative_pe(context_pos)
+        action_pos = self.action_relative_pe(action[..., :3])
+        context_pos_encoded = self.action_relative_pe(context_pos)
 
         # Attention to scene tokens
-        proprio_feats = self.gripper_context_head(
-            proprio_feats, context_feats,
-            seq1_pos=proprio_pos, seq2_pos=context_pos_encoded
+        action_feats = self.action_context_head(
+            action_feats, context_feats,
+            seq1_pos=action_pos, seq2_pos=context_pos_encoded
         )[-1]
 
-        return proprio_feats
+        return action_feats
 
-    def forward(self, pcd, proprioception, target_value=None):
+    def forward(self, pcd, action, target_value=None):
         """
         Arguments:
-            pcd: (B, N, 3) point cloud in world coordinates
-            proprioception: (B, nhist, 8) or (B, 8) current gripper pose(s)
+            pcd: (B, N, 3) point cloud in world coordinates (state)
+            action: (B, nhist, 8) or (B, 8) candidate gripper pose(s)
             target_value: (B,) or (B, 1) ground truth values for training
 
         Returns:
             - loss: scalar, if target_value is provided
-            - value: (B, 1), predicted value at inference
+            - value: (B, 1), predicted Q-value at inference
         """
-        # Handle single-step proprioception
-        if proprioception.dim() == 2:
-            proprioception = proprioception.unsqueeze(1)
+        # Handle single-step action
+        if action.dim() == 2:
+            action = action.unsqueeze(1)
 
-        # Compute scene features for proprio encoding
-        context_feats = self.scene_pos_to_feat(pcd)  # (B, N, embedding_dim)
+        # Compute scene features (shared across action encoder and value head)
+        scene_feats = self.scene_pos_to_feat(pcd)  # (B, N, embedding_dim)
 
-        # Encode proprioception with scene context
-        proprio_feats = self.encode_proprio(proprioception, context_feats, pcd)
+        # Encode action with scene context
+        action_feats = self.encode_action(action, scene_feats, pcd)
 
-        # Predict value
+        # Predict Q-value
         value = self.value_head(
-            proprio_feats=proprio_feats,
-            scene_feats=context_feats,
-            scene_pos=pcd
+            action_feats=action_feats,
+            scene_feats=scene_feats,
         )
 
         # Training: compute loss
         if target_value is not None:
             if target_value.dim() == 1:
                 target_value = target_value.unsqueeze(-1)
-            # Use L1 loss for regression with sigmoid outputs
             loss = F.l1_loss(value, target_value)
             return loss
 
-        # Inference: return predicted value
+        # Inference: return predicted Q-value
         return value
 
 
@@ -120,22 +118,12 @@ class ValueTransformerHead(nn.Module):
         # Learnable value query token
         self.value_query = nn.Parameter(torch.randn(1, 1, embedding_dim))
 
-        # Project proprio features for conditioning
-        self.proprio_proj = nn.Sequential(
+        # Project action features for AdaLN conditioning
+        self.action_proj = nn.Sequential(
             nn.Linear(embedding_dim * nhist, embedding_dim),
             nn.ReLU(),
             nn.Linear(embedding_dim, embedding_dim)
         )
-
-        # Scene token features from 3D positions
-        self.scene_pos_to_feat = nn.Sequential(
-            nn.Linear(3, embedding_dim),
-            nn.ReLU(),
-            nn.Linear(embedding_dim, embedding_dim)
-        )
-
-        # 3D rotary positional encoding
-        self.relative_pe_layer = RotaryPositionEncoding3D(embedding_dim)
 
         # Cross attention: value query attends to scene
         self.cross_attn = AttentionModule(
@@ -145,7 +133,7 @@ class ValueTransformerHead(nn.Module):
             dropout=0.1,
             n_heads=num_attn_heads,
             pre_norm=False,
-            rotary_pe=False,  # Value query has no 3D position
+            rotary_pe=False,
             use_adaln=True,
             is_self=False
         )
@@ -173,27 +161,23 @@ class ValueTransformerHead(nn.Module):
             nn.Sigmoid()  # Constrain output to [0, 1]
         )
 
-    def forward(self, proprio_feats, scene_feats, scene_pos):
+    def forward(self, action_feats, scene_feats):
         """
         Arguments:
-            proprio_feats: (B, nhist, F) - encoded proprioception features
+            action_feats: (B, nhist, F) - encoded action features
             scene_feats: (B, N, F) - scene features from point cloud
-            scene_pos: (B, N, 3) - scene positions
 
         Returns:
-            value: (B, 1) - predicted value
+            value: (B, 1) - predicted Q-value
         """
-        B = proprio_feats.shape[0]
+        B = action_feats.shape[0]
 
         # Expand value query for batch
         value_query = self.value_query.expand(B, -1, -1)  # (B, 1, F)
 
-        # Conditioning signal from proprioception
-        proprio_flat = proprio_feats.flatten(1)  # (B, nhist * F)
-        ada_sgnl = self.proprio_proj(proprio_flat)  # (B, F)
-
-        # Build scene features
-        scene_feats = self.scene_pos_to_feat(scene_pos)
+        # Conditioning signal from action (for AdaLN modulation)
+        action_flat = action_feats.flatten(1)  # (B, nhist * F)
+        ada_sgnl = self.action_proj(action_flat)  # (B, F)
 
         # Cross attention: value query attends to scene
         value_feats = self.cross_attn(
@@ -202,8 +186,9 @@ class ValueTransformerHead(nn.Module):
             ada_sgnl=ada_sgnl
         )[-1]
 
-        # Self attention among value query and scene context
-        features = torch.cat([value_feats, scene_feats], dim=1)  # (B, 1+N, F)
+        # Self attention: value query + action tokens + scene tokens
+        # Action tokens participate directly so the model can attend to them
+        features = torch.cat([value_feats, action_feats, scene_feats], dim=1)  # (B, 1+nhist+N, F)
         features = self.self_attn(
             seq1=features,
             seq2=features,

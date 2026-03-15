@@ -44,11 +44,11 @@ def start_wandb_run(args):
 def parse_arguments():
     parser = argparse.ArgumentParser("Parse arguments for main.py")
     # Tuples: (name, type, default)
-    data_path = '/home/ksaha/Research/ModelBasedPlanning/visplanWM/assets/processed_data/rollout_data_only_visited_nodes.pth'
+    data_path = '/home/ksaha/Research/ModelBasedPlanning/visplanWM/assets/processed_data/q_value_data.pth'
     arguments = [
         # Dataset/loader arguments
         ('wandb_project_name', str, "3DFA_Planning"),
-        ('wandb_run_name', str, "value_function_run_only_visited_nodes"),
+        ('wandb_run_name', str, "q_function_run_1"),
         ('train_data_dir', Path, data_path),
         ('num_workers', int, 4),
         ('batch_size', int, 32),     

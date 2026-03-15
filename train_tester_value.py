@@ -317,21 +317,21 @@ class BaseTrainTester:
 
     @torch.no_grad()
     def prepare_batch(self, sample, augment=False):
-        """Prepare batch for ValueNetwork: returns value (target), pcd, proprioception."""
+        """Prepare batch for ValueNetwork: returns value (target), pcd, action."""
         return (
             sample.get("value", None),  # Target value for training (B,) or (B, 1)
             sample["pcd"],
-            sample["proprioception"],
+            sample["action"],
         )
 
     def _model_forward(self, sample, training=True):
         """Forward pass for ValueNetwork."""
-        target_value, pcd, proprioception = self.prepare_batch(
+        target_value, pcd, action = self.prepare_batch(
             sample, augment=training
         )
         pcd = pcd.cuda(non_blocking=True).float()
-        proprioception = proprioception.cuda(non_blocking=True).float()
-        
+        action = action.cuda(non_blocking=True).float()
+
         # Prepare target_value for training
         if training and target_value is not None:
             target_value = target_value.cuda(non_blocking=True).float()
@@ -339,11 +339,11 @@ class BaseTrainTester:
             raise ValueError("target_value is required for training")
         else:
             target_value = None  # Inference mode
-        
+
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             out = self.model(
                 pcd=pcd,
-                proprioception=proprioception,
+                action=action,
                 target_value=target_value
             )
         return out  # loss if training, else value (B, 1)

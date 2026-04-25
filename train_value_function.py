@@ -14,7 +14,7 @@ from utils.common_utils import str2bool, str_none
 from train_tester_value import BaseTrainTester as TrainTester
 
 # Dataset:
-from datasets.shelf_packing_dataset import ShelfPackingDataset
+from datasets.shelf_packing_value_dataset import ShelfPackingValueDataset
 
 # Model:
 from modeling.policy.value_network import ValueNetwork
@@ -23,10 +23,13 @@ from modeling.policy.value_network import ValueNetwork
 # Helper function to find run ID by name
 def find_run_id(project_name, run_name):
     api = wandb.Api()
-    runs = api.runs(project_name)
-    for run in runs:
-        if run.name == run_name:
-            return run.id
+    try:
+        runs = api.runs(project_name)
+        for run in runs:
+            if run.name == run_name:
+                return run.id
+    except (ValueError, wandb.errors.CommError):
+        pass
     return None
 
 def start_wandb_run(args):
@@ -44,11 +47,11 @@ def start_wandb_run(args):
 def parse_arguments():
     parser = argparse.ArgumentParser("Parse arguments for main.py")
     # Tuples: (name, type, default)
-    data_path = '/home/ksaha/Research/ModelBasedPlanning/visplanWM/assets/processed_data/q_value_data.pth'
+    data_path = '/home/ksaha/Research/ModelBasedPlanning/visplanWM/assets/processed_data/q_value_data_grasp_place.pth'
     arguments = [
         # Dataset/loader arguments
-        ('wandb_project_name', str, "3DFA_Planning"),
-        ('wandb_run_name', str, "q_function_run_1"),
+        ('wandb_project_name', str, "Value_Function_Planning"),
+        ('wandb_run_name', str, "q_function_run_2"),
         ('train_data_dir', Path, data_path),
         ('num_workers', int, 4),
         ('batch_size', int, 32),     
@@ -144,7 +147,7 @@ if __name__ == '__main__':
 
     train_tester = TrainTester(
         args=args, 
-        dataset_cls=ShelfPackingDataset, 
+        dataset_cls=ShelfPackingValueDataset,
         model_cls=ValueNetwork
     )
 

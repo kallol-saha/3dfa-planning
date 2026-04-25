@@ -69,7 +69,7 @@ class ShelfPackingDataset(Dataset):
 
         # For visualization only:
         # visualize_poses_in_pointcloud(input_pcd[0].cpu().numpy(), torch.cat([goal_poses[0], self._get_proprioception(idx)[0]], axis=0), colors=([0, 1, 0], [0, 0, 1]))
-        
+
         if self._actions_only:
             return {"action": goal_poses}  # tensor(b, 2, 8) for now
         return {

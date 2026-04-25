@@ -94,8 +94,7 @@ class BaseTrainTester:
         self.model = self.model_cls(
             embedding_dim=self.args.embedding_dim,
             num_attn_heads=self.args.num_attn_heads,
-            nhist=getattr(self.args, 'nhist', 1),
-            num_shared_attn_layers=self.args.num_shared_attn_layers
+            num_shared_attn_layers=self.args.num_shared_attn_layers,
         )
 
         # Print basic modules' parameters
@@ -317,16 +316,22 @@ class BaseTrainTester:
 
     @torch.no_grad()
     def prepare_batch(self, sample, augment=False):
-        """Prepare batch for ValueNetwork: returns value (target), pcd, action."""
+        """Prepare batch for ValueNetwork.
+
+        Returns: (value, pcd, action, n_leaves).
+        n_leaves is the per-sample leaf count used to weight the loss;
+        None if not available in the dataset.
+        """
         return (
-            sample.get("value", None),  # Target value for training (B,) or (B, 1)
+            sample.get("value", None),
             sample["pcd"],
             sample["action"],
+            sample.get("n_leaves", None),
         )
 
     def _model_forward(self, sample, training=True):
         """Forward pass for ValueNetwork."""
-        target_value, pcd, action = self.prepare_batch(
+        target_value, pcd, action, n_leaves = self.prepare_batch(
             sample, augment=training
         )
         pcd = pcd.cuda(non_blocking=True).float()
@@ -340,11 +345,18 @@ class BaseTrainTester:
         else:
             target_value = None  # Inference mode
 
+        # Weight samples by log(1 + n_leaves): rich subtrees (more reliable
+        # targets) contribute more to the loss than thin 0/1 tails.
+        sample_weight = None
+        if training and n_leaves is not None:
+            sample_weight = torch.log1p(n_leaves.cuda(non_blocking=True).float())
+
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             out = self.model(
                 pcd=pcd,
                 action=action,
-                target_value=target_value
+                target_value=target_value,
+                sample_weight=sample_weight,
             )
         return out  # loss if training, else value (B, 1)
 

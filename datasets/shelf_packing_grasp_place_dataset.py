@@ -1,7 +1,11 @@
 """Dataset for the 2-pose (grasp + placement) variant of the packing policy.
 
 Reads the file produced by `save_successful_grasp_place.py`:
-    input_pcd:  FloatTensor (N, 4096, 3)
+    input_pcd:  FloatTensor (N, 4096, 4)   xyz + target_mask. The mask
+                channel marks which points belong to the object that this
+                (grasp, place) action picks up — the policy uses that to
+                disambiguate the per-object label even when many objects
+                are present in the scene.
     goal_pose:  FloatTensor (N, 2, 8)   [grasp, placement]; each token is
                 xyz(3) + quat_wxyz(4) + gripper_state(1). Index 0 is always
                 the grasp pose, index 1 is always the placement pose.
@@ -9,7 +13,7 @@ Reads the file produced by `save_successful_grasp_place.py`:
 
 Output (per sample) — matches the dict shape that the shared trainer's
 `prepare_batch` reads, so no trainer changes are required:
-    pcd:            (1, 4096, 3)
+    pcd:            (1, 4096, 4)   xyz in robot-base frame + target_mask
     action:         (1, 2, 8)
     proprioception: (1, 1, 8)   zero placeholder. The 2-pose policy ignores
                                 proprioception internally; this field exists
@@ -75,6 +79,13 @@ class ShelfPackingGraspPlaceDataset(Dataset):
             raise ValueError(
                 f"Expected goal_pose shape (N, 2, 8); got {tuple(self.data['goal_pose'].shape)}"
             )
+        if self.data["input_pcd"].ndim != 3 or self.data["input_pcd"].shape[-1] != 4:
+            raise ValueError(
+                "Expected input_pcd shape (N, P, 4) with the 4th channel = "
+                "target_mask. Got "
+                f"{tuple(self.data['input_pcd'].shape)}. Regenerate the .pth "
+                "file with the updated save_successful_grasp_place.py."
+            )
 
         print(f"[ShelfPackingGraspPlaceDataset] loaded {self.num_samples} samples from {root}")
 
@@ -86,8 +97,8 @@ class ShelfPackingGraspPlaceDataset(Dataset):
     def __getitem__(self, idx):
         idx = idx % self.num_samples
 
-        # (1, 4096, 3) → shift to robot base frame on the fly so the saved
-        # dataset stays in world coordinates.
+        # (1, 4096, 4) → shift xyz to robot base frame on the fly. The 4th
+        # channel is the target mask and must NOT be offset.
         input_pcd = copy.deepcopy(self.data["input_pcd"][idx].unsqueeze(0))
         input_pcd[..., 0] = input_pcd[..., 0] + ROBOT_BASE_X_OFFSET
 
@@ -101,7 +112,7 @@ class ShelfPackingGraspPlaceDataset(Dataset):
         proprio = self._proprio_placeholder.view(1, 1, 8)   # ignored by the model
 
         return {
-            "pcd": input_pcd,            # (1, 4096, 3) in robot base frame
+            "pcd": input_pcd,            # (1, 4096, 4) — xyz in robot-base frame + target_mask
             "action": goal_poses,        # (1, 2, 8)
             "proprioception": proprio,   # (1, 1, 8) placeholder — model ignores it
         }

@@ -77,8 +77,8 @@ class BaseTrainTester:
             batch_size=self.args.batch_size,    # The training batch size
             shuffle=True,                                               # Whether to shuffle the data each epoch
             num_workers=self.args.num_workers,                          # Number of CPU subprocesses to use for data loading
-            worker_init_fn=seed_worker,                                 # Function to seed the random number generator for each worker  
-            collate_fn=base_collate_fn,                                 # Function to merge a list of samples into a mini-batch.
+            worker_init_fn=seed_worker,                                 # Function to seed the random number generator for each worker
+            collate_fn=base_collate_fn,                                 # Per-sample value records → flat (B, ...) tensors via torch.cat.
             pin_memory=True,                                            # If True, the DataLoader will copy tensors into CUDA pinned memory before returning them
             drop_last=True,                                             # Whether to drop the last batch if it is not of the same size as the other batches
             generator=g,                                                # The random number generator to use for the data loading
@@ -316,49 +316,42 @@ class BaseTrainTester:
 
     @torch.no_grad()
     def prepare_batch(self, sample, augment=False):
-        """Prepare batch for ValueNetwork.
+        """Prepare a pointwise batch for ValueNetwork.
 
-        Returns: (value, pcd, action, n_leaves).
-        n_leaves is the per-sample leaf count used to weight the loss;
-        None if not available in the dataset.
+        Returns: (pcd, actions, targets, n_leaves).
+        targets / n_leaves may be None in inference mode.
         """
         return (
-            sample.get("value", None),
             sample["pcd"],
-            sample["action"],
+            sample["actions"],
+            sample.get("targets", None),
             sample.get("n_leaves", None),
         )
 
     def _model_forward(self, sample, training=True):
-        """Forward pass for ValueNetwork."""
-        target_value, pcd, action, n_leaves = self.prepare_batch(
-            sample, augment=training
-        )
+        """Pointwise forward pass with per-batch weighted-mean BCE."""
+        pcd, actions, targets, n_leaves = self.prepare_batch(sample, augment=training)
         pcd = pcd.cuda(non_blocking=True).float()
-        action = action.cuda(non_blocking=True).float()
+        actions = actions.cuda(non_blocking=True).float()
 
-        # Prepare target_value for training
-        if training and target_value is not None:
-            target_value = target_value.cuda(non_blocking=True).float()
-        elif training:
-            raise ValueError("target_value is required for training")
+        if training:
+            if targets is None:
+                raise ValueError("targets are required for training")
+            targets = targets.cuda(non_blocking=True).float()
+            if n_leaves is not None:
+                n_leaves = n_leaves.cuda(non_blocking=True).float()
         else:
-            target_value = None  # Inference mode
-
-        # Weight samples by log(1 + n_leaves): rich subtrees (more reliable
-        # targets) contribute more to the loss than thin 0/1 tails.
-        sample_weight = None
-        if training and n_leaves is not None:
-            sample_weight = torch.log1p(n_leaves.cuda(non_blocking=True).float())
+            targets = None
+            n_leaves = None
 
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             out = self.model(
                 pcd=pcd,
-                action=action,
-                target_value=target_value,
-                sample_weight=sample_weight,
+                actions=actions,
+                targets=targets,
+                n_leaves=n_leaves,
             )
-        return out  # loss if training, else value (B, 1)
+        return out  # scalar weighted-BCE loss if training, else (B,) sigmoid scores
 
     def train_one_step(self, scaler, lr_scheduler, sample):
         """Run a single training step."""
@@ -383,77 +376,53 @@ class BaseTrainTester:
 
     @torch.inference_mode()
     def evaluate_nsteps(self, model, loader, step_id, val_iters, split='val'):
-        """Run a given number of evaluation steps."""
+        """Pointwise eval: per-sample MSE/MAE on the predicted Q̂ vs target."""
         metrics_dict = {}
-        device = next(model.parameters()).device
         model.eval()
-
-        all_pred_values = []
-        all_gt_values = []
 
         for i, sample in tqdm(enumerate(loader)):
             if i == val_iters:
                 break
 
-            pred_value = self._model_forward(sample, training=False)  # (B, 1)
-            gt_value = sample.get("value", None)
-            
-            if gt_value is None:
-                print(f"Warning: No ground truth value found in sample, skipping metrics")
+            pred_scores = self._model_forward(sample, training=False)  # (B,)
+            gt_targets = sample.get("targets", None)
+            if gt_targets is None:
+                print("Warning: missing targets in sample, skipping metrics")
                 continue
-                
-            gt_value = gt_value.cuda(non_blocking=True).float()
-            
-            # Ensure same shape
-            if gt_value.dim() == 1:
-                gt_value = gt_value.unsqueeze(-1)
-            
-            # Compute value prediction metrics
-            mse = torch.nn.functional.mse_loss(pred_value, gt_value)
-            mae = torch.nn.functional.l1_loss(pred_value, gt_value)
-            
-            # Store metrics
-            if f"{split}-losses/mean/value_mse" not in metrics_dict:
-                metrics_dict[f"{split}-losses/mean/value_mse"] = []
-                metrics_dict[f"{split}-losses/mean/value_mae"] = []
-            
-            metrics_dict[f"{split}-losses/mean/value_mse"].append(mse.item())
-            metrics_dict[f"{split}-losses/mean/value_mae"].append(mae.item())
-            
-            # Collect for visualization
-            all_pred_values.append(pred_value.cpu())
-            all_gt_values.append(gt_value.cpu())
 
-            if (step_id + 1) % self.args.vis_freq == 0:
-                # Save a random visualization for validation
-                if i == 0:  # Only for first batch
-                    B = sample["pcd"].shape[0]
-                    idx = torch.randint(0, B, (1,)).item()
-                    
-                    # Create vis directory if it doesn't exist
-                    vis_dir = os.path.join(self.args.log_dir, "vis")
-                    os.makedirs(vis_dir, exist_ok=True)
-                    
-                    # Convert to numpy and detach from GPU
-                    # Convert bfloat16 to float32 before numpy conversion
-                    pcd_np = sample["pcd"][idx].cpu().detach().float().numpy()
-                    pred_value_np = pred_value[idx].cpu().detach().float().numpy()
-                    gt_value_np = gt_value[idx].cpu().detach().float().numpy()
-                    
-                    # Save as NPZ file
-                    filename = os.path.join(vis_dir, f"step_{(step_id + 1)}.npz")
-                    np.savez_compressed(
-                        filename,
-                        pcd=pcd_np,
-                        pred_value=pred_value_np,
-                        gt_value=gt_value_np,
-                        step_id=(step_id + 1)
-                    )
-                    
-                    print(f"Saved visualization data to: {filename}")
-                    print(f"  PCD shape: {pcd_np.shape}")
-                    print(f"  Pred value: {pred_value_np}")
-                    print(f"  GT value: {gt_value_np}")
+            gt_targets = gt_targets.cuda(non_blocking=True).float()
+            diff = pred_scores.float() - gt_targets
+            mse = diff.pow(2).mean()
+            mae = diff.abs().mean()
+
+            for key, val in [
+                (f"{split}-losses/mean/value_mse", mse.item()),
+                (f"{split}-losses/mean/value_mae", mae.item()),
+            ]:
+                metrics_dict.setdefault(key, []).append(val)
+
+            if (step_id + 1) % self.args.vis_freq == 0 and i == 0:
+                B = sample["pcd"].shape[0]
+                idx = torch.randint(0, B, (1,)).item()
+
+                vis_dir = os.path.join(self.args.log_dir, "vis")
+                os.makedirs(vis_dir, exist_ok=True)
+
+                pcd_np = sample["pcd"][idx].cpu().detach().float().numpy()
+                pred_np = pred_scores[idx].cpu().detach().float().numpy()
+                gt_np = gt_targets[idx].cpu().detach().float().numpy()
+
+                filename = os.path.join(vis_dir, f"step_{(step_id + 1)}.npz")
+                np.savez_compressed(
+                    filename,
+                    pcd=pcd_np,
+                    pred_score=pred_np,
+                    gt_target=gt_np,
+                    step_id=(step_id + 1),
+                )
+                print(f"Saved visualization data to: {filename}")
+                print(f"  PCD shape: {pcd_np.shape}")
+                print(f"  Pred score: {float(pred_np):.4f}  GT target: {float(gt_np):.4f}")
 
         # Average metrics
         values = {k: np.mean(v) for k, v in metrics_dict.items()}
@@ -472,17 +441,39 @@ class BaseTrainTester:
         return values
 
     def load_checkpoint(self, model, ema_model, optimizer):
-        """Load from checkpoint."""
+        """Load from checkpoint.
+
+        Two modes, distinguished by whether `--checkpoint` is inside the
+        current run's `log_dir`:
+
+        - **Same-run resume** (e.g. auto-restart after a crash, ckpt is
+          `<log_dir>/best.pth` or `<log_dir>/last.pth`): preserves
+          `iter`, `best_loss`, and optimizer state so training continues
+          where it left off.
+        - **Cross-run warm-start** (ckpt is in a *different* run dir):
+          loads weights + EMA only; resets `iter=0`, `best_loss=None`,
+          and skips optimizer state. The new run starts fresh in its
+          own log_dir, just initialized from somebody else's weights.
+        """
         print("=> trying checkpoint '{}'".format(self.args.checkpoint))
         if not os.path.exists(self.args.checkpoint):
             print('Warning: checkpoint was not found, starting from scratch')
             print('The main process will compute workspace bounds')
             return 0, None
 
+        ckpt_path = os.path.realpath(self.args.checkpoint)
+        log_dir = os.path.realpath(str(self.args.log_dir))
+        same_run = os.path.dirname(ckpt_path) == log_dir
+        mode = "same-run resume" if same_run else "cross-run warm-start"
+        print(f"=> load mode: {mode}")
+
         model_dict = torch.load(
             self.args.checkpoint,
             map_location="cpu",
-            weights_only=True
+            # weights_only=False because old checkpoints stored
+            # `best_loss` as a numpy scalar, which the post-2.6 safe
+            # unpickler refuses. We trust our own checkpoints.
+            weights_only=False
         )
         # Load weights flexibly
         msn, unxpct = model.load_state_dict(model_dict["weight"], strict=False)
@@ -497,14 +488,18 @@ class BaseTrainTester:
         # EMA weights
         if model_dict.get("ema_weight") is not None:
             ema_model.load_state_dict(model_dict["ema_weight"], strict=True)
-        # Useful for resuming training
-        if 'optimizer' in model_dict and not self.args.eval_only:
-            optimizer.load_state_dict(model_dict["optimizer"])
-        start_iter = model_dict.get("iter", 0)
-        best_loss = model_dict.get("best_loss", None)
 
-        print("=> loaded successfully '{}' (step {})".format(
-            self.args.checkpoint, model_dict.get("iter", 0)
+        if same_run:
+            if 'optimizer' in model_dict and not self.args.eval_only:
+                optimizer.load_state_dict(model_dict["optimizer"])
+            start_iter = model_dict.get("iter", 0)
+            best_loss = model_dict.get("best_loss", None)
+        else:
+            start_iter = 0
+            best_loss = None
+
+        print("=> loaded successfully '{}' (resume from step {})".format(
+            self.args.checkpoint, start_iter
         ))
         del model_dict
         torch.cuda.empty_cache()

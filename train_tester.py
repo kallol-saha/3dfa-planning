@@ -447,17 +447,39 @@ class BaseTrainTester:
         return values
 
     def load_checkpoint(self, model, ema_model, optimizer):
-        """Load from checkpoint."""
+        """Load from checkpoint.
+
+        Two modes, distinguished by whether `--checkpoint` is inside the
+        current run's `log_dir`:
+
+        - **Same-run resume** (e.g. auto-restart after a crash, ckpt is
+          `<log_dir>/best.pth` or `<log_dir>/last.pth`): preserves
+          `iter`, `best_loss`, and optimizer state so training continues
+          where it left off.
+        - **Cross-run warm-start** (ckpt is in a *different* run dir):
+          loads weights + EMA only; resets `iter=0`, `best_loss=None`,
+          and skips optimizer state. The new run starts fresh in its
+          own log_dir, just initialized from somebody else's weights.
+        """
         print("=> trying checkpoint '{}'".format(self.args.checkpoint))
         if not os.path.exists(self.args.checkpoint):
             print('Warning: checkpoint was not found, starting from scratch')
             print('The main process will compute workspace bounds')
             return 0, None
 
+        ckpt_path = os.path.realpath(self.args.checkpoint)
+        log_dir = os.path.realpath(str(self.args.log_dir))
+        same_run = os.path.dirname(ckpt_path) == log_dir
+        mode = "same-run resume" if same_run else "cross-run warm-start"
+        print(f"=> load mode: {mode}")
+
         model_dict = torch.load(
             self.args.checkpoint,
             map_location="cpu",
-            weights_only=True
+            # weights_only=False because old checkpoints stored
+            # `best_loss` as a numpy scalar, which the post-2.6 safe
+            # unpickler refuses. We trust our own checkpoints.
+            weights_only=False
         )
         # Load weights flexibly
         msn, unxpct = model.load_state_dict(model_dict["weight"], strict=False)
@@ -472,14 +494,18 @@ class BaseTrainTester:
         # EMA weights
         if model_dict.get("ema_weight") is not None:
             ema_model.load_state_dict(model_dict["ema_weight"], strict=True)
-        # Useful for resuming training
-        if 'optimizer' in model_dict and not self.args.eval_only:
-            optimizer.load_state_dict(model_dict["optimizer"])
-        start_iter = model_dict.get("iter", 0)
-        best_loss = model_dict.get("best_loss", None)
 
-        print("=> loaded successfully '{}' (step {})".format(
-            self.args.checkpoint, model_dict.get("iter", 0)
+        if same_run:
+            if 'optimizer' in model_dict and not self.args.eval_only:
+                optimizer.load_state_dict(model_dict["optimizer"])
+            start_iter = model_dict.get("iter", 0)
+            best_loss = model_dict.get("best_loss", None)
+        else:
+            start_iter = 0
+            best_loss = None
+
+        print("=> loaded successfully '{}' (resume from step {})".format(
+            self.args.checkpoint, start_iter
         ))
         del model_dict
         torch.cuda.empty_cache()

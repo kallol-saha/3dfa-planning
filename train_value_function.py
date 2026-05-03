@@ -41,28 +41,36 @@ def start_wandb_run(args):
     else:
         print(f"Creating new run: {run_name}")
         wandb.init(project=args.wandb_project_name, name=run_name)
-    # Save args to wandb
-    wandb.config.update(args)
+    # Save args to wandb. allow_val_change=True so a resumed run tolerates
+    # CLI/script default changes between attempts (e.g., bumped batch_size
+    # after an OOM crash).
+    wandb.config.update(args, allow_val_change=True)
 
 def parse_arguments():
     parser = argparse.ArgumentParser("Parse arguments for main.py")
     # Tuples: (name, type, default)
-    data_path = '/home/ksaha/Research/ModelBasedPlanning/visplanWM/assets/processed_data/q_value_data_grasp_place.pth'
+    data_path = '/home/ksaha/Research/ModelBasedPlanning/visplanWM/assets/processed_data/q_value_data_grasp_place_phase2.pth'
+    resume_ckpt = '/home/ksaha/Research/ModelBasedPlanning/visplanWM/models/flowmatch_actor/train_logs/Value_Function_Planning/q_function_run_2/best.pth'
     arguments = [
         # Dataset/loader arguments
         ('wandb_project_name', str, "Value_Function_Planning"),
-        ('wandb_run_name', str, "q_function_run_2"),
+        ('wandb_run_name', str, "q_function_pointwise_phase2_resume"),
         ('train_data_dir', Path, data_path),
         ('num_workers', int, 4),
-        ('batch_size', int, 32),     
-        ('batch_size_val', int, 32),  
+        # Pointwise BCE — one (state, action) pair per row, no K dim,
+        # so we can run the original batch size again (listwise had
+        # forced this to 4 because of B × K_max effective batches).
+        ('batch_size', int, 32),
+        ('batch_size_val', int, 32),
         ('chunk_size', int, 1),
         ('memory_limit', float, 8),  # cache limit in GB
         # Logging arguments
         # ('base_log_dir', Path, Path(__file__).parent / "train_logs"),
         ('base_log_dir', Path, "/home/ksaha/Research/ModelBasedPlanning/visplanWM/models/flowmatch_actor/train_logs"),
-        # Training and testing arguments
-        ('checkpoint', str_none, 'checkpoints'),  # TODO: Change to checkpoint file if it is there
+        # Training and testing arguments — resume from the pre-listwise
+        # pointwise BCE checkpoint by default. Pass `--checkpoint null`
+        # (or a non-existent path) to train from scratch.
+        ('checkpoint', str_none, resume_ckpt),
         ('val_freq', int, 20),
         ('vis_freq', int, 1000),            # NOTE: Should be a multiple of val_freq
         ('interm_ckpt_freq', int, 3000),       # NOTE: Should be a multiple of val_freq

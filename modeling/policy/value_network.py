@@ -7,11 +7,16 @@ from ..utils.position_encodings import RotaryPositionEncoding3D
 
 
 class ValueNetwork(nn.Module):
-    """Q-function V(s, a_grasp, a_place).
+    """Pointwise Q-function V(s, a_grasp, a_place).
 
-    The action now consists of a (grasp_pose, placement_pose) pair, each 8-D
-    (xyz + quat + gripper). Both are MLP-encoded so their full values
-    participate directly in the attention tokens (not only via AdaLN).
+    The action is a (grasp_pose, placement_pose) pair, each 8-D
+    (xyz + quat + gripper). The scene PCD is 3-channel xyz only —
+    no target-object mask. (The 4-channel masked-PCD experiment
+    landed alongside the listwise loss refactor on 2026-04-30 and
+    was reverted on 2026-05-01.)
+
+    Loss: per-batch weighted-mean BCE on success-fraction targets,
+    with sample weight = log1p(n_leaves).
     """
 
     ACTION_DIM = 8
@@ -23,13 +28,11 @@ class ValueNetwork(nn.Module):
                  num_shared_attn_layers=4):
         super().__init__()
 
-        # Encodes the raw 8-D action pose into a token feature
         self.action_encoder = nn.Sequential(
             nn.Linear(self.ACTION_DIM, embedding_dim),
             nn.ReLU(),
             nn.Linear(embedding_dim, embedding_dim),
         )
-        # Learnable type embeddings distinguish grasp (idx 0) from placement (idx 1)
         self.action_type_embed = nn.Embedding(self.NUM_ACTION_TOKENS, embedding_dim)
 
         self.action_relative_pe = RotaryPositionEncoding3D(embedding_dim)
@@ -39,6 +42,7 @@ class ValueNetwork(nn.Module):
             pre_norm=False,
         )
 
+        # 3-channel input: xyz only.
         self.scene_pos_to_feat = nn.Sequential(
             nn.Linear(3, embedding_dim),
             nn.ReLU(),
@@ -64,16 +68,13 @@ class ValueNetwork(nn.Module):
         """
         B = action.shape[0]
 
-        # MLP over full 8-D action → action token feature (depends on pose+gripper)
         action_feats = self.action_encoder(action)  # (B, 2, F)
 
-        # Add type embedding so the model knows which token is grasp vs placement
         type_idx = torch.arange(
             self.NUM_ACTION_TOKENS, device=action.device
-        ).unsqueeze(0).expand(B, -1)  # (B, 2)
+        ).unsqueeze(0).expand(B, -1)
         action_feats = action_feats + self.action_type_embed(type_idx)
 
-        # Rotary PE on action xyz and scene xyz for cross-attention
         action_pos = self.action_relative_pe(action[..., :3])
         context_pos_encoded = self.action_relative_pe(context_pos)
 
@@ -84,49 +85,46 @@ class ValueNetwork(nn.Module):
 
         return action_feats
 
-    def forward(self, pcd, action, target_value=None, sample_weight=None):
-        """
+    def forward(self, pcd, actions, targets=None, n_leaves=None):
+        """Pointwise scoring + per-batch weighted-mean BCE.
+
         Args:
-            pcd: (B, N, 3)
-            action: (B, 2, 8) or (B, 16) — grasp + placement.
-            target_value: (B,) or (B, 1) — probability target in [0, 1].
-            sample_weight: (B,) or (B, 1) — per-sample loss weight (optional).
+            pcd:      (B, N, 3)   xyz only.
+            actions:  (B, 2, 8)   grasp+place tokens.
+            targets:  (B,) or None   success-fraction targets in [0, 1].
+                                      If None, returns inference scores.
+            n_leaves: (B,) or None   per-sample leaf count for log1p weighting.
+                                      If None at training, samples are unweighted.
 
         Returns:
-            loss (if target_value provided) or predicted value (B, 1).
-
-        Loss: weighted BCE on the sigmoid-output probability. The network's
-        final layer is Sigmoid, so we reconstruct BCE from probabilities
-        (avoids numerical mismatch with BCE-with-logits).
+            training:   scalar weighted-mean BCE loss
+            inference:  (B,) sigmoid scores
         """
-        if action.dim() == 2:
-            assert action.shape[-1] == self.ACTION_DIM * self.NUM_ACTION_TOKENS, (
-                f"Flat action must have dim {self.ACTION_DIM * self.NUM_ACTION_TOKENS}, "
-                f"got {action.shape[-1]}"
-            )
-            action = action.view(action.shape[0], self.NUM_ACTION_TOKENS, self.ACTION_DIM)
-        assert action.shape[1:] == (self.NUM_ACTION_TOKENS, self.ACTION_DIM), (
-            f"Action must be (B, 2, 8), got {tuple(action.shape)}"
-        )
+        assert pcd.shape[-1] == 3, \
+            f"pcd last dim must be 3 (xyz), got {tuple(pcd.shape)}"
+        assert actions.shape[-2:] == (self.NUM_ACTION_TOKENS, self.ACTION_DIM), \
+            f"actions must end with (2, 8), got {tuple(actions.shape)}"
 
-        scene_feats = self.scene_pos_to_feat(pcd)
-        action_feats = self.encode_action(action, scene_feats, pcd)
-        logits = self.value_head(action_feats=action_feats, scene_feats=scene_feats)
+        scene_feats = self.scene_pos_to_feat(pcd)              # (B, N, F)
 
-        if target_value is not None:
-            if target_value.dim() == 1:
-                target_value = target_value.unsqueeze(-1)
-            bce = F.binary_cross_entropy_with_logits(
-                logits, target_value.to(logits.dtype), reduction="none"
-            )
+        action_feats = self.encode_action(actions, scene_feats, pcd)
+        logits = self.value_head(
+            action_feats=action_feats, scene_feats=scene_feats,
+        ).squeeze(-1)                                          # (B,)
 
-            if sample_weight is not None:
-                if sample_weight.dim() == 1:
-                    sample_weight = sample_weight.unsqueeze(-1)
-                w = sample_weight.to(logits.dtype)
-                return (bce * w).sum() / w.sum().clamp_min(1e-8)
-            return bce.mean()
-        return torch.sigmoid(logits)
+        if targets is None:
+            return torch.sigmoid(logits)
+
+        targets = targets.to(logits.dtype)
+        per_sample = F.binary_cross_entropy_with_logits(
+            logits, targets, reduction="none",
+        )                                                       # (B,)
+
+        if n_leaves is None:
+            return per_sample.mean()
+
+        weights = torch.log1p(n_leaves.to(logits.dtype))        # (B,)
+        return (weights * per_sample).sum() / weights.sum().clamp_min(1e-6)
 
 
 class ValueTransformerHead(nn.Module):
@@ -141,7 +139,6 @@ class ValueTransformerHead(nn.Module):
 
         self.value_query = nn.Parameter(torch.randn(1, 1, embedding_dim))
 
-        # AdaLN conditioning signal pooled from all action tokens
         self.action_proj = nn.Sequential(
             nn.Linear(embedding_dim * num_action_tokens, embedding_dim),
             nn.ReLU(),
@@ -178,8 +175,8 @@ class ValueTransformerHead(nn.Module):
 
         value_query = self.value_query.expand(B, -1, -1)  # (B, 1, F)
 
-        action_flat = action_feats.flatten(1)  # (B, num_action_tokens * F)
-        ada_sgnl = self.action_proj(action_flat)  # (B, F)
+        action_flat = action_feats.flatten(1)
+        ada_sgnl = self.action_proj(action_flat)
 
         value_feats = self.cross_attn(
             seq1=value_query, seq2=scene_feats, ada_sgnl=ada_sgnl,

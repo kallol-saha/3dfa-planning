@@ -26,6 +26,10 @@ class DenoiseActor(nn.Module):
         The `forward(...)` signature still accepts `proprioception` for
         compatibility with the shared trainer interface, but the kwarg
         is ignored internally.
+      * The point cloud has 4 channels: xyz + a target_mask channel that
+        marks which points belong to the object the policy should grasp.
+        The mask is fed only into `scene_pos_to_feat` (not into rotary
+        positional encodings, which still use xyz only).
       * Gripper state is not predicted. It is hardcoded at the output
         from `gripper_schedule` ([1.0, 0.0] — closed at grasp, open at
         place) and is not part of the loss.
@@ -37,6 +41,9 @@ class DenoiseActor(nn.Module):
     trajectory_length = 2
     gripper_schedule = (1.0, 0.0)        # idx 0 = grasp (closed), idx 1 = place (open)
     pose_loss_weights = (2.0, 1.0)       # grasp gets 2x the weight of placement
+    # PCD has xyz (3) + target-object mask (1). Width of the input fed to
+    # `TransformerHead.scene_pos_to_feat`. Rotary PE still uses xyz only.
+    pcd_input_channels = 4
 
     def __init__(self,
                  # Encoder and decoder arguments
@@ -81,7 +88,8 @@ class DenoiseActor(nn.Module):
             embedding_dim=embedding_dim,
             num_attn_heads=num_attn_heads,
             num_shared_attn_layers=num_shared_attn_layers,
-            rot_dim=3 if rotation_format == 'euler' else 6
+            rot_dim=3 if rotation_format == 'euler' else 6,
+            pcd_feat_dim=self.pcd_input_channels,
         )
 
         # Noise/denoise schedulers and hyperparameters
@@ -148,7 +156,9 @@ class DenoiseActor(nn.Module):
         Args:
             trajectory: (B, traj_len, 9) - noisy trajectory (pos + 6D rot)
             timestep: (B,) - denoising timestep
-            pcd: (B, N, 3) - point cloud positions
+            pcd: (B, N, pcd_input_channels) - xyz + target_mask. The head
+                slices xyz for positional encodings and feeds the full
+                vector into the scene-feature MLP.
         """
         trajectory_feats = self.traj_encoder(trajectory)
 
@@ -192,7 +202,7 @@ class DenoiseActor(nn.Module):
         Generate trajectory from noise via iterative denoising.
 
         Args:
-            pcd: (B, N, 3) - point cloud positions
+            pcd: (B, N, pcd_input_channels) - xyz + target_mask.
 
         Returns:
             trajectory: (B, 2, 8). Position + quaternion (wxyz) + gripper.
@@ -222,7 +232,8 @@ class DenoiseActor(nn.Module):
             gt_trajectory: (B, 2, 8) from the dataset. We strip the trailing
                 gripper channel here because the model never predicts it —
                 the gripper schedule is hardcoded at the output.
-            pcd: (B, N, 3) — point cloud in world coordinates.
+            pcd: (B, N, pcd_input_channels) — xyz in robot-base frame +
+                target_mask channel.
         """
         gt_trajectory = gt_trajectory[..., :7]             # drop gripper
         gt_trajectory = self.normalize_pos(gt_trajectory)
@@ -344,7 +355,8 @@ class DenoiseActor(nn.Module):
         Arguments:
             gt_trajectory: (B, 2, 7) at training. pos + quat_wxyz; the gripper
                 channel must be stripped by the dataset since it is not predicted.
-            pcd: (B, N, 3) point cloud in world coordinates.
+            pcd: (B, N, pcd_input_channels) point cloud in robot-base frame
+                with a target-mask 4th channel.
             proprioception: ignored. Present only because the shared trainer
                 interface (`prepare_batch` / `_model_forward`) passes it.
 
@@ -367,9 +379,12 @@ class TransformerHead(nn.Module):
                  num_shared_attn_layers=4,
                  nhist=1,        # accepted for parity with original ctor; unused
                  rotary_pe=True,
-                 rot_dim=6):
+                 rot_dim=6,
+                 pcd_feat_dim=3):
         super().__init__()
         del nhist  # proprio path removed
+
+        self.pcd_feat_dim = pcd_feat_dim
 
         # Different embeddings
         self.time_emb = nn.Sequential(
@@ -380,9 +395,11 @@ class TransformerHead(nn.Module):
         )
         self.traj_time_emb = SinusoidalPosEmb(embedding_dim)
 
-        # Scene token features from 3D positions only
+        # Scene token features. Input width = pcd_feat_dim so the MLP can
+        # consume xyz alone (legacy 3-channel PCD) or xyz + target_mask
+        # (4-channel PCD used by the 2-pose grasp+place policy).
         self.scene_pos_to_feat = nn.Sequential(
-            nn.Linear(3, embedding_dim),
+            nn.Linear(pcd_feat_dim, embedding_dim),
             nn.ReLU(),
             nn.Linear(embedding_dim, embedding_dim)
         )
@@ -473,7 +490,10 @@ class TransformerHead(nn.Module):
             traj_feats: (B, trajectory_length, F)
             trajectory: (B, trajectory_length, 3+6+X)
             timesteps: (B,) or (B, 1)
-            rgb3d_pos: (B, N, 3)
+            rgb3d_pos: (B, N, pcd_feat_dim). The first 3 channels are xyz
+                (used for rotary positional encoding); any remaining
+                channels are extra per-point features (e.g. target_mask)
+                that are fed only into `scene_pos_to_feat`.
 
         Returns:
             list of (B, trajectory_length, 3+6) — pos + 6D rot per token.
@@ -488,13 +508,15 @@ class TransformerHead(nn.Module):
         traj_feats = traj_feats + traj_time_pos
 
         traj_xyz = trajectory[..., :3]
+        rgb3d_xyz = rgb3d_pos[..., :3]
 
         time_embs = self.encode_denoising_timestep(timesteps)
 
         rel_traj_pos, rel_scene_pos, rel_pos = self.get_positional_embeddings(
-            traj_xyz, rgb3d_pos
+            traj_xyz, rgb3d_xyz
         )
 
+        # Full vector (xyz + extras) goes into the scene MLP.
         rgb3d_feats = self.scene_pos_to_feat(rgb3d_pos)
 
         traj_feats = self.cross_attn(
@@ -532,11 +554,13 @@ class TransformerHead(nn.Module):
     def get_positional_embeddings(
         self,
         traj_xyz,
-        rgb3d_pos
+        rgb3d_xyz,
     ):
-        # Rotary PE for trajectories and scene positions
+        # Rotary PE for trajectories and scene positions. Both inputs are
+        # strictly xyz; any extra per-point features must be sliced off
+        # by the caller before getting here.
         rel_traj_pos = self.relative_pe_layer(traj_xyz)
-        rel_scene_pos = self.relative_pe_layer(rgb3d_pos)
+        rel_scene_pos = self.relative_pe_layer(rgb3d_xyz)
         rel_pos = torch.cat([rel_traj_pos, rel_scene_pos], dim=1)
         return rel_traj_pos, rel_scene_pos, rel_pos
 

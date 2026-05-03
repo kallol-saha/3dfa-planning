@@ -124,16 +124,17 @@ def start_wandb_run(args):
         print(f"Creating new run: {run_name}")
         wandb.init(project=args.wandb_project_name, name=run_name)
     # Save args to wandb
-    wandb.config.update(args)
+    wandb.config.update(args, allow_val_change=True)
 
 def parse_arguments():
     parser = argparse.ArgumentParser("Parse arguments for main.py")
     # Tuples: (name, type, default)
-    data_path = '/home/ksaha/Research/ModelBasedPlanning/visplanWM/assets/processed_data/successful_grasp_place.pth'
+    data_path = '/home/ksaha/Research/ModelBasedPlanning/visplanWM/assets/processed_data/successful_grasp_place_phase2.pth'
+    resume_ckpt = '/home/ksaha/Research/ModelBasedPlanning/visplanWM/models/flowmatch_actor/train_logs/Value_Function_Planning/grasp_place_policy_phase2_v1/best.pth'
     arguments = [
         # Dataset/loader arguments
         ('wandb_project_name', str, "Value_Function_Planning"),
-        ('wandb_run_name', str, "grasp_place_policy_run_3"),
+        ('wandb_run_name', str, "grasp_place_policy_phase2_v2"),
         ('train_data_dir', Path, data_path),
         ('num_workers', int, 4),
         ('batch_size', int, 64),
@@ -143,8 +144,10 @@ def parse_arguments():
         # Logging arguments
         # ('base_log_dir', Path, Path(__file__).parent / "train_logs"),
         ('base_log_dir', Path, "/home/ksaha/Research/ModelBasedPlanning/visplanWM/models/flowmatch_actor/train_logs"),
-        # Training and testing arguments
-        ('checkpoint', str_none, 'checkpoints'),  # TODO: Change to checkpoint file if it is there
+        # Training and testing arguments — resume from the previous
+        # grasp+place policy checkpoint by default. Pass `--checkpoint
+        # null` (or a non-existent path) to train from scratch.
+        ('checkpoint', str_none, resume_ckpt),
         ('val_freq', int, 100),
         ('vis_freq', int, 1000),            # NOTE: Should be a multiple of val_freq
         ('interm_ckpt_freq', int, 3000),       # NOTE: Should be a multiple of val_freq

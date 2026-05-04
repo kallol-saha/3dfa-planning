@@ -232,7 +232,10 @@ class BaseTrainTester:
         """Run main training/testing pipeline."""
 
         # self.tokenizer = fetch_tokenizers(self.args.backbone)
-        if not os.path.exists(self.args.checkpoint):
+        # `checkpoint=None` means train from scratch — fit the workspace
+        # normalizer from training data (same path as a missing checkpoint
+        # file). Without this guard, os.path.exists(None) raises TypeError.
+        if self.args.checkpoint is None or not os.path.exists(self.args.checkpoint):
             normalizer = self.get_workspace_normalizer()
             self.model.workspace_normalizer.copy_(normalizer)
 

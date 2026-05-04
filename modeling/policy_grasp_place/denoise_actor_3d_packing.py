@@ -41,9 +41,6 @@ class DenoiseActor(nn.Module):
     trajectory_length = 2
     gripper_schedule = (1.0, 0.0)        # idx 0 = grasp (closed), idx 1 = place (open)
     pose_loss_weights = (2.0, 1.0)       # grasp gets 2x the weight of placement
-    # PCD has xyz (3) + target-object mask (1). Width of the input fed to
-    # `TransformerHead.scene_pos_to_feat`. Rotary PE still uses xyz only.
-    pcd_input_channels = 4
 
     def __init__(self,
                  # Encoder and decoder arguments
@@ -58,13 +55,21 @@ class DenoiseActor(nn.Module):
                  denoise_timesteps=100,
                  denoise_model="ddpm",
                  # Training arguments
-                 lv2_batch_size=1):
+                 lv2_batch_size=1,
+                 # Width of the input fed to `TransformerHead.scene_pos_to_feat`.
+                 # 4 = xyz + target-object mask (the original masked variant).
+                 # 3 = xyz only (the `target-only` data variant where every
+                 # other non-shelved object has been removed from the scene
+                 # before sampling, so the mask is implicit). Rotary PE still
+                 # uses xyz only — this only affects scene_pos_to_feat.
+                 pcd_input_channels=4):
         super().__init__()
         # Arguments to be accessed by the main class
         self._rotation_format = rotation_format
         self._relative = relative
         self._lv2_batch_size = lv2_batch_size
         self._nhist = nhist
+        self.pcd_input_channels = int(pcd_input_channels)
 
         # Per-pose loss weights as a non-learnable buffer so they move with
         # the module and are visible in `state_dict`.

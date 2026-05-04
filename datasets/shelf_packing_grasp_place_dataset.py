@@ -1,11 +1,16 @@
 """Dataset for the 2-pose (grasp + placement) variant of the packing policy.
 
-Reads the file produced by `save_successful_grasp_place.py`:
-    input_pcd:  FloatTensor (N, 4096, 4)   xyz + target_mask. The mask
-                channel marks which points belong to the object that this
-                (grasp, place) action picks up — the policy uses that to
-                disambiguate the per-object label even when many objects
-                are present in the scene.
+Reads either the legacy 4-channel masked file produced by
+`save_successful_grasp_place.py` / `save_phase2_data.py`, **or** the
+3-channel target-only file produced by
+`save_successful_grasp_place_target_only.py`:
+    input_pcd:  FloatTensor (N, 4096, 4)   xyz + target_mask  — masked variant
+                FloatTensor (N, 4096, 3)   xyz only           — target-only variant
+                The masked variant marks which points belong to the
+                grasp-target object via channel 4. The target-only variant
+                achieves the same disambiguation by *removing* every other
+                non-shelved object from the scene before sampling, so the
+                target is the only object on the table side of the PCD.
     goal_pose:  FloatTensor (N, 2, 8)   [grasp, placement]; each token is
                 xyz(3) + quat_wxyz(4) + gripper_state(1). Index 0 is always
                 the grasp pose, index 1 is always the placement pose.
@@ -13,12 +18,14 @@ Reads the file produced by `save_successful_grasp_place.py`:
 
 Output (per sample) — matches the dict shape that the shared trainer's
 `prepare_batch` reads, so no trainer changes are required:
-    pcd:            (1, 4096, 4)   xyz in robot-base frame + target_mask
+    pcd:            (1, 4096, C)   xyz in robot-base frame [+ optional mask]
     action:         (1, 2, 8)
     proprioception: (1, 1, 8)   zero placeholder. The 2-pose policy ignores
                                 proprioception internally; this field exists
                                 only because `BaseTrainTester.prepare_batch`
                                 indexes `sample["proprioception"]`.
+The model must be constructed with `pcd_input_channels=C` matching the
+loaded data; the trainer wires this through.
 
 This file is deliberately kept separate from `shelf_packing_dataset.py` so the
 existing placement-only policy and its loader remain untouched.
@@ -79,15 +86,20 @@ class ShelfPackingGraspPlaceDataset(Dataset):
             raise ValueError(
                 f"Expected goal_pose shape (N, 2, 8); got {tuple(self.data['goal_pose'].shape)}"
             )
-        if self.data["input_pcd"].ndim != 3 or self.data["input_pcd"].shape[-1] != 4:
+        if self.data["input_pcd"].ndim != 3 or self.data["input_pcd"].shape[-1] not in (3, 4):
             raise ValueError(
-                "Expected input_pcd shape (N, P, 4) with the 4th channel = "
-                "target_mask. Got "
+                "Expected input_pcd shape (N, P, 3) (target-only variant) "
+                "or (N, P, 4) (masked variant). Got "
                 f"{tuple(self.data['input_pcd'].shape)}. Regenerate the .pth "
-                "file with the updated save_successful_grasp_place.py."
+                "file with save_successful_grasp_place.py / "
+                "save_phase2_data.py / save_successful_grasp_place_target_only.py."
             )
+        self.pcd_input_channels = int(self.data["input_pcd"].shape[-1])
 
-        print(f"[ShelfPackingGraspPlaceDataset] loaded {self.num_samples} samples from {root}")
+        print(
+            f"[ShelfPackingGraspPlaceDataset] loaded {self.num_samples} samples "
+            f"from {root} (pcd channels={self.pcd_input_channels})"
+        )
 
         self._proprio_placeholder = PLACEHOLDER_PROPRIO.clone()
 
@@ -97,8 +109,9 @@ class ShelfPackingGraspPlaceDataset(Dataset):
     def __getitem__(self, idx):
         idx = idx % self.num_samples
 
-        # (1, 4096, 4) → shift xyz to robot base frame on the fly. The 4th
-        # channel is the target mask and must NOT be offset.
+        # (1, 4096, C) where C is 4 (xyz + target_mask) or 3 (xyz only) →
+        # shift xyz to robot base frame on the fly. Only channel 0 (x) is
+        # offset; the optional mask channel must NOT be offset.
         input_pcd = copy.deepcopy(self.data["input_pcd"][idx].unsqueeze(0))
         input_pcd[..., 0] = input_pcd[..., 0] + ROBOT_BASE_X_OFFSET
 
@@ -112,7 +125,7 @@ class ShelfPackingGraspPlaceDataset(Dataset):
         proprio = self._proprio_placeholder.view(1, 1, 8)   # ignored by the model
 
         return {
-            "pcd": input_pcd,            # (1, 4096, 4) — xyz in robot-base frame + target_mask
+            "pcd": input_pcd,            # (1, 4096, C) — xyz in robot-base frame [+ mask if C=4]
             "action": goal_poses,        # (1, 2, 8)
             "proprioception": proprio,   # (1, 1, 8) placeholder — model ignores it
         }

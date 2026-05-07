@@ -58,9 +58,91 @@ class TrainTester(BaseTrainTester):
         training file.
     """
 
-    def evaluate_nsteps(self, *args, **kwargs):
-        metrics = super().evaluate_nsteps(*args, **kwargs)
-        return _filter_to_losses(metrics)
+    def _gt_slice_for_mode(self, gt_action):
+        """Slice the full (B, 2, 8) GT to match the model's output shape.
+
+        grasp mode predicts pose index 0 only → (B, 1, 8).
+        place mode predicts pose index 1 only → (B, 1, 8).
+        joint mode predicts both             → (B, 2, 8) unchanged.
+        """
+        mode = self.args.mode
+        if mode == "joint":
+            return gt_action
+        if mode == "grasp":
+            return gt_action[:, 0:1, :]
+        if mode == "place":
+            return gt_action[:, 1:2, :]
+        raise ValueError(f"Unknown mode {mode!r}")
+
+    @torch.no_grad()
+    def evaluate_nsteps(self, model, loader, step_id, val_iters, split='val'):
+        from utils.trainers.utils import compute_metrics
+        import os
+        import numpy as np
+
+        values = {}
+        device = next(model.parameters()).device
+        model.eval()
+
+        for i, sample in enumerate(loader):
+            if i == val_iters:
+                break
+
+            pred_action = self._model_forward(sample, training=False)
+            gt_action = sample["action"].cuda(non_blocking=True)
+            gt_action = self._gt_slice_for_mode(gt_action)
+
+            losses, losses_B = compute_metrics(pred_action, gt_action)
+
+            if (step_id + 1) % self.args.vis_freq == 0 and i == 0:
+                vis_dir = os.path.join(self.args.log_dir, "vis")
+                os.makedirs(vis_dir, exist_ok=True)
+                idx = torch.randint(0, pred_action.shape[0], (1,)).item()
+                filename = os.path.join(vis_dir, f"step_{(step_id + 1)}.npz")
+                np.savez_compressed(
+                    filename,
+                    pcd=sample["pcd"][idx].cpu().numpy(),
+                    pred=pred_action[idx].cpu().numpy(),
+                    gt=gt_action[idx].cpu().numpy(),
+                    step_id=(step_id + 1),
+                )
+
+            for n, l in losses.items():
+                key = f"{split}-losses/mean/{n}"
+                if key not in values:
+                    values[key] = torch.Tensor([]).to(device)
+                values[key] = torch.cat([values[key], l.unsqueeze(0)])
+
+        values = {k: v.mean().item() for k, v in values.items()}
+        print(f"Step {step_id}:")
+        for key, value in values.items():
+            print(f"{key}: {value:.03f}")
+
+        return _filter_to_losses(values)
+
+    def _mode_kwargs(self):
+        """Translate `--mode {joint,grasp,place}` to DenoiseActor kwargs."""
+        mode = self.args.mode
+        if mode == "joint":
+            return {"trajectory_length": 2, "grasp_condition_dim": None}
+        if mode == "grasp":
+            return {"trajectory_length": 1, "grasp_condition_dim": None}
+        if mode == "place":
+            return {"trajectory_length": 1, "grasp_condition_dim": 7}
+        raise ValueError(f"--mode must be one of joint|grasp|place; got {mode!r}")
+
+    def _pose_slice_for_mode(self):
+        """Which pose index/indices does this mode predict?
+        joint → [0,1], grasp → [0], place → [1]. Used by the workspace-
+        normalizer fit so we only fit on the pose(s) this model predicts."""
+        mode = self.args.mode
+        if mode == "joint":
+            return [0, 1]
+        if mode == "grasp":
+            return [0]
+        if mode == "place":
+            return [1]
+        raise ValueError(f"--mode must be one of joint|grasp|place; got {mode!r}")
 
     def get_model(self):
         # Sanity-check that the data on disk has the channel count the
@@ -87,6 +169,7 @@ class TrainTester(BaseTrainTester):
             denoise_model=self.args.denoise_model,
             lv2_batch_size=self.args.lv2_batch_size,
             pcd_input_channels=int(self.args.pcd_input_channels),
+            **self._mode_kwargs(),
         )
 
         from utils.common_utils import count_parameters
@@ -98,20 +181,20 @@ class TrainTester(BaseTrainTester):
         return self.model
 
     def get_workspace_normalizer(self, ndims=3):
-        """Per-pose min/max of (grasp, place) positions in robot-base frame.
+        """Per-pose min/max of positions in robot-base frame, sliced by mode.
 
-        Returns a `(2, L, ndims)` parameter where axis 0 is (min, max),
-        axis 1 is the pose index (0 grasp, 1 place), and axis 2 is xyz.
-        Per-pose fitting matches the diffusion noise scale to each pose's
-        actual range — pickup-region and shelf-interior have very different
-        per-axis spreads, so a single combined normalizer wastes SNR.
+        Returns a `(2, L, ndims)` parameter where L matches the model's
+        `trajectory_length` (1 or 2). Per-pose fitting matches the diffusion
+        noise scale to each pose's actual range — pickup-region and shelf-
+        interior have very different per-axis spreads.
 
         The dataset's `__getitem__` adds ROBOT_BASE_X_OFFSET to the x
         channel before handing samples to the trainer; we mirror that
         shift here so the normalizer is computed in the same frame the
         model trains in.
         """
-        print("[grasp_place] Fitting per-pose workspace_normalizer from training data...")
+        print(f"[grasp_place] Fitting per-pose workspace_normalizer "
+              f"(mode={self.args.mode}) from training data...")
 
         data = torch.load(self.args.train_data_dir, map_location="cpu")
         if "goal_pose" not in data:
@@ -120,8 +203,9 @@ class TrainTester(BaseTrainTester):
                 f"(got {list(data.keys())})."
             )
 
-        # (N, L, 8) -> (N, L, ndims)
-        positions = data["goal_pose"][..., :ndims].clone().float()
+        pose_slice = self._pose_slice_for_mode()
+        # data["goal_pose"]: (N, 2, 8) → slice to (N, len(pose_slice), ndims)
+        positions = data["goal_pose"][:, pose_slice, :ndims].clone().float()
         positions[..., 0] = positions[..., 0] + ROBOT_BASE_X_OFFSET
 
         buf = float(self.args.workspace_normalizer_buffer)
@@ -130,8 +214,9 @@ class TrainTester(BaseTrainTester):
         max_ = positions.max(dim=0).values + buf   # (L, ndims)
 
         n, L, _ = positions.shape
-        print(f"[grasp_place] data-fit per-pose normalizer (n={n} samples, L={L}, buffer={buf}):")
-        names = ["grasp", "place"] if L == 2 else [f"pose_{i}" for i in range(L)]
+        print(f"[grasp_place] data-fit normalizer (n={n} samples, L={L}, buffer={buf}):")
+        full_names = {0: "grasp", 1: "place"}
+        names = [full_names[i] for i in pose_slice]
         for i in range(L):
             print(
                 f"  {names[i]:>5s}: "
@@ -176,9 +261,17 @@ def parse_arguments():
     arguments = [
         # Dataset/loader arguments
         ('wandb_project_name', str, "Value_Function_Planning"),
-        ('wandb_run_name', str, "grasp_place_policy_target_only_v1"),
+        # `__MODE__` is a sentinel that gets replaced post-parse with
+        # the actual mode (grasp/place/joint), so the same command line
+        # produces a sensibly named run regardless of --mode. Override
+        # this to a literal string to opt out of the auto-naming.
+        ('wandb_run_name', str, "grasp_place_cascaded___MODE___v3"),
         ('train_data_dir', Path, data_path),
-        ('num_workers', int, 4),
+        # num_workers=1: post-deepcopy fix the per-sample work is ~0.2 ms,
+        # so multi-worker IPC adds more overhead than it saves. 1 worker is
+        # enough to overlap data loading with the previous step's compute
+        # via prefetch_factor=2.
+        ('num_workers', int, 1),
         ('batch_size', int, 64),
         ('batch_size_val', int, 64),
         ('chunk_size', int, 1),
@@ -186,15 +279,30 @@ def parse_arguments():
         # Logging arguments
         # ('base_log_dir', Path, Path(__file__).parent / "train_logs"),
         ('base_log_dir', Path, "/home/ksaha/Research/ModelBasedPlanning/visplanWM/models/flowmatch_actor/train_logs"),
-        # Train from scratch — the existing 4-channel checkpoint
-        # `grasp_place_policy_phase2_v1/best.pth` has a `Linear(4, F)`
-        # for `scene_pos_to_feat` that can't be loaded into the 3-channel
-        # head. Pass `--checkpoint <path>` explicitly to resume.
-        ('checkpoint', str_none, None),
-        ('val_freq', int, 100),
+        # Resume-from-last default. Points at this run's own `last.pth`
+        # so re-running the same command auto-resumes; if the file
+        # doesn't exist (first launch) the trainer prints a warning and
+        # starts from scratch (load_checkpoint handles missing-file).
+        # The `__MODE__` sentinel is replaced post-parse just like
+        # `wandb_run_name`. Pass `--checkpoint null` to force from-scratch.
+        ('checkpoint', str_none,
+         "/home/ksaha/Research/ModelBasedPlanning/visplanWM/models/flowmatch_actor/"
+         "train_logs/Value_Function_Planning/grasp_place_cascaded___MODE___v2/last.pth"),
+        # val_freq 100 → 1000 (2026-05-04). Train-eval is expensive
+        # (val_iters batches × denoise_timesteps inference passes); doing
+        # it less often + with fewer batches recovers most of the wall
+        # time. Per-step train loss is now logged separately by the
+        # trainer for tighter optimizer feedback.
+        ('val_freq', int, 1000),
+        # val_iters 10 → 2 (2026-05-04): cap eval cost. The metric is
+        # noisier per call, but with val_freq=1000 the chart updates
+        # only ~7×/h anyway and the optimizer-side signal lives in
+        # `train/step_loss`.
+        ('val_iters', int, 2),
         ('vis_freq', int, 1000),            # NOTE: Should be a multiple of val_freq
         ('interm_ckpt_freq', int, 3000),       # NOTE: Should be a multiple of val_freq
         ('eval_only', str2bool, False),
+        ('start_iter', int, None),
         ('lr', float, 1e-4),
         ('backbone_lr', float, 1e-4),
         ('lr_scheduler', str, "constant"),
@@ -224,7 +332,10 @@ def parse_arguments():
         ('num_shared_attn_layers', int, 4),
         ('relative_action', str2bool, False),
         ('rotation_format', str, 'quat_wxyz'),
-        ('denoise_timesteps', int, 10),
+        # Bumped 10 -> 30 (2026-05-04). RF is step-count-agnostic at
+        # inference, so 30 also applies to MCTS sampling without retraining.
+        # Trade-off: 3x more transformer forwards per inference call.
+        ('denoise_timesteps', int, 30),
         ('denoise_model', str, "rectified_flow"),
         # Width of the input fed to the head's `scene_pos_to_feat` linear.
         # 4 = legacy masked PCD (xyz + target_mask). 3 = target-only PCD
@@ -233,6 +344,16 @@ def parse_arguments():
         # `train_data_dir` .pth — `TrainTester.get_model` asserts this.
         # Default 3 matches the default `train_data_dir` (target-only).
         ('pcd_input_channels', int, 3),
+        # Cascaded grasp→place mode (added 2026-05-04):
+        #   joint  → legacy 2-pose model (predicts grasp+place jointly)
+        #   grasp  → single-pose model that predicts only the grasp
+        #   place  → single-pose model that predicts only the place,
+        #            conditioned on the GT grasp (teacher forcing) at
+        #            training time. At inference the place model takes
+        #            the clean grasp from the trained grasp model.
+        # Both single-pose modes use the same `goal_pose` field of the
+        # dataset; the training-time slicing happens inside DenoiseActor.
+        ('mode', str, 'grasp'),
     ]
     for arg in arguments:
         parser.add_argument(f'--{arg[0]}', type=arg[1], default=arg[2])
@@ -254,6 +375,14 @@ if __name__ == '__main__':
     print("Arguments:")
     print(args)
     print("-" * 100)
+
+    # Resolve the __MODE__ sentinel in wandb_run_name + checkpoint so
+    # the defaults pick up the right per-mode names automatically.
+    # Users can opt out by passing literal strings without "__MODE__".
+    if "__MODE__" in args.wandb_run_name:
+        args.wandb_run_name = args.wandb_run_name.replace("__MODE__", args.mode)
+    if args.checkpoint is not None and "__MODE__" in str(args.checkpoint):
+        args.checkpoint = str(args.checkpoint).replace("__MODE__", args.mode)
 
     log_dir = args.base_log_dir / args.wandb_project_name / args.wandb_run_name
     args.log_dir = log_dir

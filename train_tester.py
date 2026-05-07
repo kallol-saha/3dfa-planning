@@ -261,6 +261,9 @@ class BaseTrainTester:
         start_iter, best_loss = 0, None
         if self.args.checkpoint:
             start_iter, best_loss = self.load_checkpoint(self.model, ema_model, self.optimizer)
+        if getattr(self.args, "start_iter", None) is not None:
+            start_iter = int(self.args.start_iter)
+            print(f"=> --start_iter override: {start_iter}")
         print(self.model.workspace_normalizer)
 
         # Eval only
@@ -282,6 +285,19 @@ class BaseTrainTester:
         samples_per_epoch = len(self.train_loader)
         epoch = start_iter // samples_per_epoch + 1
 
+        # Eval before training starts so the metric is visible immediately
+        # (useful on resume / warm-start with a new wandb run).
+        if self.args.checkpoint:
+            self.model.eval()
+            metrics = self.evaluate_nsteps(
+                ema_model if self.args.use_ema else self.model,
+                self.train_loader, start_iter,
+                val_iters=getattr(self.args, "val_iters", 10),
+                split='train'
+            )
+            wandb.log(metrics, step=start_iter)
+            self.model.train()
+
         # Training loop
         self.model.train()
         iter_loader = iter(self.train_loader)
@@ -295,8 +311,16 @@ class BaseTrainTester:
                 iter_loader = iter(self.train_loader)
                 sample = next(iter_loader)
 
-            self.train_one_step(scaler, lr_scheduler, sample)
+            step_loss = self.train_one_step(scaler, lr_scheduler, sample)
             self.ema.step(self.model, ema_model, self.args.use_ema, step_id)
+
+            # Per-step training loss (the value the optimizer is minimizing
+            # — noise-prediction abs error in normalized SE(3) space,
+            # weighted 30·pos + 10·rot, mean over `lv2_batch_size`). Free
+            # to log because the .item() sync is cheap relative to the
+            # forward+backward.
+            wandb.log({"train/step_loss": float(step_loss.item())},
+                      step=step_id)
 
             if (step_id + 1) % self.args.val_freq == 0:
 
@@ -305,16 +329,19 @@ class BaseTrainTester:
 
                 self.model.eval()
 
+                # `val_iters` arg added 2026-05-04 to cap eval cost. Falls
+                # back to the legacy hardcoded 10 if the train script
+                # doesn't expose the arg, so older callers stay unaffected.
                 metrics = self.evaluate_nsteps(
                     ema_model if self.args.use_ema else self.model,
                     self.train_loader, step_id,
-                    val_iters=10,
+                    val_iters=getattr(self.args, "val_iters", 10),
                     split='train'
                 )
 
                 new_loss = metrics['train-losses/mean/traj_pos_l2']
 
-                wandb.log(metrics)      # NOTE: Comment out here for disabling wandb
+                wandb.log(metrics, step=step_id)      # NOTE: Comment out here for disabling wandb
 
                 # save model
                 best_loss = self.save_checkpoint(
@@ -349,7 +376,8 @@ class BaseTrainTester:
         return out  # loss if training, else action
 
     def train_one_step(self, scaler, lr_scheduler, sample):
-        """Run a single training step."""
+        """Run a single training step. Returns the scalar loss so the
+        main loop can log it (see per-step `train/step_loss` log call)."""
         self.optimizer.zero_grad()
 
         # Forward pass
@@ -368,6 +396,8 @@ class BaseTrainTester:
 
         # Step the lr scheduler
         lr_scheduler.step()
+
+        return loss
 
     @torch.inference_mode()
     def evaluate_nsteps(self, model, loader, step_id, val_iters, split='val'):

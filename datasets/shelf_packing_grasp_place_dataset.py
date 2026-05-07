@@ -31,8 +31,6 @@ This file is deliberately kept separate from `shelf_packing_dataset.py` so the
 existing placement-only policy and its loader remain untouched.
 """
 
-import copy
-
 import torch
 from torch.utils.data import Dataset
 
@@ -112,11 +110,15 @@ class ShelfPackingGraspPlaceDataset(Dataset):
         # (1, 4096, C) where C is 4 (xyz + target_mask) or 3 (xyz only) →
         # shift xyz to robot base frame on the fly. Only channel 0 (x) is
         # offset; the optional mask channel must NOT be offset.
-        input_pcd = copy.deepcopy(self.data["input_pcd"][idx].unsqueeze(0))
+        # Use .clone() instead of copy.deepcopy(): deepcopy follows the
+        # tensor view back to the (N, 4096, 3) parent storage and copies
+        # all ~472 MB on every __getitem__ (~50 ms/call). .clone() copies
+        # only the 49 KB view (~0.2 ms/call). See profile_grasp_place_dataloader.py.
+        input_pcd = self.data["input_pcd"][idx].unsqueeze(0).clone()
         input_pcd[..., 0] = input_pcd[..., 0] + ROBOT_BASE_X_OFFSET
 
         # (1, 2, 8) — grasp at index 0, placement at index 1.
-        goal_poses = copy.deepcopy(self.data["goal_pose"][idx].unsqueeze(0))
+        goal_poses = self.data["goal_pose"][idx].unsqueeze(0).clone()
         goal_poses[..., 0] = goal_poses[..., 0] + ROBOT_BASE_X_OFFSET
 
         if self._actions_only:

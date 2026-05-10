@@ -15,6 +15,7 @@ from train_tester_value import BaseTrainTester as TrainTester
 
 # Dataset:
 from datasets.shelf_packing_value_dataset import ShelfPackingValueDataset
+from datasets.sim2real_value_dataset import Sim2RealShelfPackingValueDataset
 
 # Model:
 from modeling.policy.value_network import ValueNetwork
@@ -105,7 +106,15 @@ def parse_arguments():
         ('relative_action', str2bool, False),
         ('rotation_format', str, 'quat_wxyz'),
         ('denoise_timesteps', int, 10),
-        ('denoise_model', str, "rectified_flow")
+        ('denoise_model', str, "rectified_flow"),
+        # Sim2real augmentation: when set, the dataset wraps the same .pth
+        # in `Sim2RealShelfPackingValueDataset`, which adds noise + holes +
+        # per-part SE(3) and centers/scales each sample into a unit ball.
+        # ValueNetwork does not consult workspace_normalizer internally, so
+        # no normalizer override is required here. Requires `--env_root`.
+        ('sim2real', str2bool, False),
+        ('env_root', Path,
+         "/home/ksaha/Research/ModelBasedPlanning/visplanWM/assets/environments/train"),
     ]
     for arg in arguments:
         parser.add_argument(f'--{arg[0]}', type=arg[1], default=arg[2])
@@ -153,9 +162,21 @@ if __name__ == '__main__':
     # dataset_class = fetch_dataset_class(args.dataset)
     # model_class = fetch_model_class(args.model_type)
 
+    if args.sim2real:
+        env_root_for_dataset = args.env_root
+        def dataset_cls(**kwargs):
+            return Sim2RealShelfPackingValueDataset(
+                env_root=env_root_for_dataset,
+                **kwargs,
+            )
+        print(f"[value] sim2real=True; using Sim2RealShelfPackingValueDataset "
+              f"with env_root={env_root_for_dataset}")
+    else:
+        dataset_cls = ShelfPackingValueDataset
+
     train_tester = TrainTester(
-        args=args, 
-        dataset_cls=ShelfPackingValueDataset,
+        args=args,
+        dataset_cls=dataset_cls,
         model_cls=ValueNetwork
     )
 

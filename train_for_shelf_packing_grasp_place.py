@@ -29,6 +29,7 @@ from datasets.shelf_packing_grasp_place_dataset import (
     ShelfPackingGraspPlaceDataset,
     ROBOT_BASE_X_OFFSET,
 )
+from datasets.sim2real_grasp_place_dataset import Sim2RealShelfPackingGraspPlaceDataset
 
 # Model (2-pose grasp+place variant):
 from modeling.policy_grasp_place.denoise_actor_3d_packing import DenoiseActor
@@ -192,7 +193,23 @@ class TrainTester(BaseTrainTester):
         channel before handing samples to the trainer; we mirror that
         shift here so the normalizer is computed in the same frame the
         model trains in.
+
+        When `--sim2real` is set, the dataloader already centers and scales
+        every sample into a unit ball, so the normalizer is forced to the
+        identity range [-1, 1] (per pose, per ndim) and no data fit runs.
         """
+        if getattr(self.args, "sim2real", False):
+            pose_slice = self._pose_slice_for_mode()
+            L = len(pose_slice)
+            print(f"[grasp_place] sim2real on → workspace_normalizer = "
+                  f"[-1, 1] for L={L} pose(s), ndims={ndims}")
+            min_ = torch.full((L, ndims), -1.0)
+            max_ = torch.full((L, ndims), 1.0)
+            return nn.Parameter(
+                torch.stack([min_, max_]).float(),    # (2, L, ndims)
+                requires_grad=False,
+            )
+
         print(f"[grasp_place] Fitting per-pose workspace_normalizer "
               f"(mode={self.args.mode}) from training data...")
 
@@ -354,6 +371,14 @@ def parse_arguments():
         # Both single-pose modes use the same `goal_pose` field of the
         # dataset; the training-time slicing happens inside DenoiseActor.
         ('mode', str, 'grasp'),
+        # Sim2real augmentation: when set, the dataset wraps the same .pth
+        # in `Sim2RealShelfPackingGraspPlaceDataset`, which adds noise +
+        # holes + per-part SE(3) and centers/scales each sample into a
+        # unit ball. The trainer also forces the workspace_normalizer to
+        # the identity [-1, 1] range. Requires `--env_root`.
+        ('sim2real', str2bool, False),
+        ('env_root', Path,
+         "/home/ksaha/Research/ModelBasedPlanning/visplanWM/assets/environments/train"),
     ]
     for arg in arguments:
         parser.add_argument(f'--{arg[0]}', type=arg[1], default=arg[2])
@@ -409,9 +434,24 @@ if __name__ == '__main__':
     # dataset_class = fetch_dataset_class(args.dataset)
     # model_class = fetch_model_class(args.model_type)
 
+    if args.sim2real:
+        # Bind env_root so BaseTrainTester can keep its (root=, relative_action=,
+        # mem_limit=) instantiation signature. Functools.partial would also
+        # work; a closure is the same thing in fewer characters.
+        env_root_for_dataset = args.env_root
+        def dataset_cls(**kwargs):
+            return Sim2RealShelfPackingGraspPlaceDataset(
+                env_root=env_root_for_dataset,
+                **kwargs,
+            )
+        print(f"[grasp_place] sim2real=True; using "
+              f"Sim2RealShelfPackingGraspPlaceDataset with env_root={env_root_for_dataset}")
+    else:
+        dataset_cls = ShelfPackingGraspPlaceDataset
+
     train_tester = TrainTester(
         args=args,
-        dataset_cls=ShelfPackingGraspPlaceDataset,
+        dataset_cls=dataset_cls,
         model_cls=DenoiseActor
     )
 
